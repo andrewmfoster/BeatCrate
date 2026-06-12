@@ -1,0 +1,4 @@
+build/
+build-*/
+*.vst3/
+.DS_Store
