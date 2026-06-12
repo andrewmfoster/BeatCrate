@@ -1,0 +1,28 @@
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/
+# Cargo.lock IS tracked — this is an app (binary), so we want locked, reproducible deps.
+
+# Local build-path/username redaction (security): --remap-path-prefix lives here
+src-tauri/.cargo/config.toml
+
+# Node (if a build step is added later)
+node_modules/
+
+# Runtime user data — real avatar uploads live in the app data dir, not the repo
+public/uploads/
+
+# Internal working notes — kept local, deliberately not published.
+docs/PORT_STATUS.md
+docs/TAURI_PORT_BRIEF.md
+docs/AUDIT_2026-05-31.md
+docs/AUDIT_CODEX_2026-05-31.md
+
+# Project genealogy + machine-specific notes — local companion to CLAUDE.md
+CLAUDE.local.md
+
+# OS
+.DS_Store
+
+# Claude Code transient scheduling lock
+.claude/scheduled_tasks.lock

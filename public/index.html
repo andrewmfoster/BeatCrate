@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BeatCrate</title>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="welcoming mesh-fullscreen">
+
+<div class="titlebar">
+  <div class="titlebar-history">
+    <button class="titlebar-nav-btn titlebar-history-btn" id="nav-back" title="Back" onclick="navigateBack()" disabled>
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M14 6l-6 6 6 6"/></svg>
+    </button>
+    <button class="titlebar-nav-btn titlebar-history-btn" id="nav-forward" title="Forward" onclick="navigateForward()" disabled>
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M10 6l6 6-6 6"/></svg>
+    </button>
+  </div>
+  <div class="titlebar-nav-gap"></div>
+  <nav class="titlebar-nav" aria-label="Library navigation">
+    <button class="titlebar-nav-btn" id="tnav-home" title="Home" onclick="showHome()">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 11l8-7 8 7v9a1 1 0 0 1-1 1h-4v-6h-6v6H5a1 1 0 0 1-1-1z"/></svg>
+    </button>
+    <button class="titlebar-nav-btn" id="tnav-all" title="Library" onclick="showAllCrates()">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h14"/></svg>
+    </button>
+    <button class="titlebar-nav-btn" id="tnav-career" title="Career Arc" onclick="showCareerArc()">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 18l5-7 4 4 7-9"/><path d="M4 21h17"/></svg>
+    </button>
+  </nav>
+  <div class="titlebar-logo" aria-label="BeatCrate">
+    <svg class="titlebar-logo-icon" width="24" height="24" viewBox="0 0 100 100" fill="none" aria-hidden="true">
+      <defs>
+        <clipPath id="logo-vinyl-clip"><circle cx="50" cy="50" r="49"/></clipPath>
+      </defs>
+      <g clip-path="url(#logo-vinyl-clip)">
+        <path d="M50,1 A49,49 0 0,0 50,99 Z" fill="#ede5d3"/>
+        <path d="M50,1 A49,49 0 0,1 50,99 Z" fill="#060a07"/>
+        <circle cx="50" cy="50" r="43" fill="none" stroke="rgba(180,140,72,0.42)" stroke-width="1.5"/>
+        <circle cx="50" cy="50" r="36" fill="none" stroke="rgba(180,140,72,0.36)" stroke-width="1.5"/>
+        <circle cx="50" cy="50" r="29" fill="none" stroke="rgba(180,140,72,0.40)" stroke-width="1.5"/>
+        <line x1="50" y1="1" x2="50" y2="99" stroke="#060a07" stroke-width="2.5"/>
+        <circle cx="50" cy="50" r="17" fill="#c8a35a"/>
+        <circle cx="50" cy="50" r="4" fill="#060a07"/>
+      </g>
+    </svg>
+    <span class="titlebar-logo-wordmark">
+      <span class="titlebar-logo-beat">BEAT</span><span class="titlebar-logo-crate">CRATE</span>
+    </span>
+  </div>
+  <button class="titlebar-nav-btn titlebar-search-btn" id="tnav-search" title="Search (⌘K)" onclick="openSearchModal()">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="M16 16l4 4"/></svg>
+  </button>
+  <button class="titlebar-avatar" id="titlebar-avatar" title="Settings" onclick="showSettings()"></button>
+</div>
+
+<div class="app-body">
+  <!-- MAIN -->
+  <div class="main">
+
+    <!-- PROFILE ONBOARDING (first launch — name + avatar) -->
+    <div class="view" id="view-profile-onboarding">
+      <div class="profile-ob-mesh-wrap" id="profile-ob-mesh-wrap"></div>
+      <div class="profile-ob">
+        <div class="profile-ob-card">
+          <svg class="profile-ob-vinyl" width="52" height="52" viewBox="0 0 38 38" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <path d="M 19 0 A 19 19 0 0 0 19 38 Z" fill="#ede5d3"/>
+            <path d="M 19 0 A 19 19 0 0 1 19 38 Z" fill="#0c1410"/>
+            <circle cx="19" cy="19" r="15.5" stroke="rgba(237,229,211,0.32)" stroke-width="0.6"/>
+            <circle cx="19" cy="19" r="12.5" stroke="rgba(237,229,211,0.32)" stroke-width="0.6"/>
+            <circle cx="19" cy="19" r="9.5"  stroke="rgba(237,229,211,0.32)" stroke-width="0.6"/>
+            <circle cx="19" cy="19" r="7"    stroke="rgba(237,229,211,0.32)" stroke-width="0.6"/>
+            <line x1="19" y1="0" x2="19" y2="38" stroke="rgba(237,229,211,0.55)" stroke-width="1"/>
+            <circle cx="19" cy="19" r="5.5" fill="#c8a35a"/>
+            <circle cx="19" cy="19" r="1.6" fill="#060a07"/>
+          </svg>
+          <div class="profile-ob-title">Welcome to BeatCrate.</div>
+          <div class="profile-ob-sub">Your music library, organized like crates.<br>Let's get you set up.</div>
+          <div class="profile-ob-avatar-wrap">
+            <div class="profile-ob-avatar" id="profile-ob-avatar-preview" onclick="document.getElementById('profile-ob-file').click()">
+              <span class="profile-ob-avatar-plus">+</span>
+            </div>
+            <input type="file" id="profile-ob-file" accept="image/*" style="display:none">
+            <div class="profile-ob-avatar-hint">Add a photo <span class="profile-ob-optional">(optional)</span></div>
+          </div>
+          <input class="profile-ob-name-input" id="profile-ob-name" type="text" placeholder="What's your name?" maxlength="60" autocomplete="off">
+          <button class="profile-ob-btn" id="profile-ob-btn" onclick="finishProfileOnboarding()">Get Started</button>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ONBOARDING -->
+    <div class="view" id="view-onboarding">
+      <div class="onboarding-mesh-wrap" id="onboarding-mesh-wrap"></div>
+      <div class="onboarding">
+        <div class="onboarding-card">
+          <div class="onboarding-title">Where are your beats?</div>
+          <div class="onboarding-sub">
+            Point BeatCrate at your albums folder.<br>
+            Each subfolder becomes a crate.
+          </div>
+          <input class="onboarding-input" id="onboarding-path-input" type="text" placeholder="/path/to/your/albums" autocomplete="off" spellcheck="false" style="display:none">
+          <button class="onboarding-btn" id="onboarding-btn">Choose Folder</button>
+          <div class="onboarding-path" id="onboarding-path"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- HOME VIEW -->
+    <div class="view active" id="view-home">
+      <div class="home-view">
+        <div class="home-mesh-wrap" id="home-mesh-wrap"></div>
+        <div class="home-scroll">
+          <!-- Header band -->
+          <div class="home-header-band">
+            <h1 class="home-hdr-title">Home base</h1>
+            <div class="home-hdr-readout">
+              <span class="home-hdr-time" id="home-hdr-time"></span>
+              <span class="home-hdr-date" id="home-hdr-date"></span>
+            </div>
+          </div>
+          <div id="home-control-row"></div>
+          <!-- Hero stats (rendered by JS) -->
+          <div class="home-hero" id="home-hero"></div>
+          <!-- Two-column body -->
+          <div class="home-body">
+            <div class="home-most-played">
+              <div class="home-sect-hdr">
+                <span class="home-sect-title">Most Played</span>
+                <div class="home-sect-actions">
+                  <span class="home-mp-period" id="home-mp-period">THIS WEEK</span>
+                  <span class="home-mp-viewall" onclick="hwViewAll()">VIEW ALL →</span>
+                </div>
+              </div>
+              <div class="home-tracks" id="home-tracks-list"></div>
+            </div>
+            <div class="home-plate">
+              <div class="home-sect-hdr">
+                <div class="home-plate-title-group">
+                  <span class="home-sect-title">On Your Plate</span>
+                  <button class="home-todo-add-btn" id="home-todo-add-btn" onclick="openTodoInput()">+</button>
+                </div>
+                <span class="home-plate-open" id="home-plate-open"></span>
+              </div>
+              <div class="home-todo">
+                <input class="home-todo-input" id="home-todo-input" placeholder="Add a task…" maxlength="200" autocomplete="off" style="display:none">
+                <div class="home-todo-list" id="home-todo-list"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- GRID VIEW -->
+    <div class="view" id="view-grid">
+      <div class="grid-view">
+        <div class="grid-mesh-wrap" id="grid-mesh-wrap"></div>
+        <div class="grid-scroll">
+          <div class="grid-main">
+            <!-- Aurora library header -->
+            <div class="lib-header-band">
+              <h1 class="lib-hdr-title" id="grid-title">Library</h1>
+              <div class="home-synced-pill">
+                <div class="home-synced-dot"></div>
+                <span id="synced-label">SYNCED</span>
+              </div>
+            </div>
+            <div id="library-filter-row"></div>
+            <div class="crate-grid" id="crate-grid"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- CAREER ARC VIEW -->
+    <div class="view" id="view-career">
+      <div class="career-view">
+        <div class="career-mesh-wrap" id="career-mesh-wrap"></div>
+        <div class="career-scroll">
+          <div class="career-main" id="career-main"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- DETAIL VIEW -->
+    <div class="view" id="view-detail">
+      <div id="detail-backdrop" aria-hidden="true"><div id="detail-backdrop-img"></div></div>
+      <div class="detail-view">
+        <div class="detail-content">
+          <div class="detail-art-col">
+            <div class="detail-art">
+              <div id="detail-art-container"></div>
+            </div>
+            <div class="detail-crate-name" id="detail-name"></div>
+            <div id="detail-producer"></div>
+            <div class="detail-crate-sub" id="detail-sub"></div>
+            <div id="detail-status"></div>
+            <textarea class="crate-scratchpad" id="crate-scratchpad" placeholder="Notes about this crate…"></textarea>
+          </div>
+          <div class="detail-tracks-col">
+            <div class="tracks-body">
+              <div class="tracks-list-col">
+                <div class="tracks-header">
+                  <div class="th-num">#</div>
+                  <div class="th-name">Title</div>
+                  <div class="th-tags">Tags</div>
+                  <div class="th-dur">Time</div>
+                  <div class="th-star"></div>
+                  <div class="th-notes">Notes</div>
+                </div>
+                <div class="tracks-list" id="tracks-list"></div>
+              </div>
+              <aside class="inspector-panel" id="inspector-panel">
+                <button class="inspector-close" onclick="closeInspector()" title="Close">×</button>
+                <div class="inspector-content" id="inspector-content">
+                  <div class="inspector-empty">Select a track</div>
+                </div>
+              </aside>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- PLAYBACK BAR -->
+<div class="playback-bar">
+  <!-- Row 1: Scrubber + timestamps -->
+  <div class="pb-scrubber-row">
+    <span class="pb-time pb-time-current" id="pb-current">0:00</span>
+    <div class="pb-seek" id="pb-seek">
+      <div class="pb-seek-fill" id="pb-seek-fill"></div>
+    </div>
+    <span class="pb-time pb-time-total" id="pb-duration">0:00</span>
+  </div>
+  <!-- Row 2: Now-playing · Controls · Tags -->
+  <div class="pb-main-row">
+    <div class="pb-track-info" id="pb-track-info" onclick="navigateToPlayingCrate()">
+      <div class="pb-art" id="pb-art"></div>
+      <div>
+        <div class="pb-track-name" id="pb-track-name">—</div>
+        <div class="pb-crate-name" id="pb-crate-name">—</div>
+      </div>
+    </div>
+    <div class="pb-controls">
+      <div class="pb-buttons">
+        <button class="pb-btn pb-star" id="btn-pb-star" title="Favorite" onclick="togglePbFavorite(event)">★</button>
+        <div class="pb-note-wrap" id="pb-note-wrap">
+          <button class="pb-btn pb-note" id="btn-pb-note" title="Notes" onclick="togglePbNotePopover(event)"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><rect x="2.5" y="1.5" width="9" height="11" rx="1.4" stroke="currentColor" stroke-width="1.2"/><line x1="4.6" y1="4.5" x2="9.4" y2="4.5" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/><line x1="4.6" y1="7"   x2="9.4" y2="7"   stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/><line x1="4.6" y1="9.5" x2="7.8" y2="9.5" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/></svg><span class="pb-note-badge" id="pb-note-badge" aria-hidden="true"></span></button>
+          <div class="pb-note-popover" id="pb-note-popover" aria-hidden="true">
+            <div class="pb-note-popover-inner">
+              <div class="pb-note-title">
+                <span class="pb-note-title-text" id="pb-note-title-text">—</span>
+              </div>
+              <ul class="inspector-notes-list" id="pb-note-list"></ul>
+              <div class="pb-note-empty" id="pb-note-empty" style="display:none">No notes yet.</div>
+              <div class="inspector-note-add">
+                <button class="inspector-note-add-btn" id="pb-note-add-btn">+ add note</button>
+                <input class="inspector-note-input" id="pb-note-input" placeholder="Type note…" style="display:none">
+              </div>
+            </div>
+          </div>
+        </div>
+        <button class="pb-btn pb-jukebox" id="btn-jukebox" title="Beat Roulette" onclick="toggleJukeboxMode()"><svg width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true"><rect x="1" y="1" width="12" height="12" rx="2" stroke="currentColor" stroke-width="1.3"/><circle cx="4.5" cy="4.5" r="1.1" fill="currentColor"/><circle cx="9.5" cy="4.5" r="1.1" fill="currentColor"/><circle cx="4.5" cy="9.5" r="1.1" fill="currentColor"/><circle cx="9.5" cy="9.5" r="1.1" fill="currentColor"/></svg></button>
+        <button class="pb-btn" id="btn-prev">⏮</button>
+        <button class="pb-btn play" id="btn-play">▶</button>
+        <button class="pb-btn" id="btn-next">⏭</button>
+        <button class="pb-btn pb-repeat" id="btn-repeat" title="Repeat: off">↻</button>
+        <div class="pb-vol-wrap" id="pb-vol-wrap">
+          <button class="pb-btn pb-volume" id="btn-volume" title="Volume"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M1 5.5L4.5 5.5L8 3L8 13L4.5 10.5L1 10.5Z" fill="currentColor"/><path d="M10 6.5 Q11.5 8 10 9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M11.5 4.5 Q14.5 8 11.5 11.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>
+          <div class="pb-vol-popup" id="pb-vol-popup">
+            <input type="range" class="pb-vol-popup-slider" id="pb-vol-slider" min="0" max="100" value="100">
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="pb-right" id="pb-tags"></div>
+  </div>
+</div>
+
+<!-- SETTINGS POPOVER -->
+<div class="settings-popover" id="settings-popover" aria-hidden="true">
+  <div class="settings-card" role="dialog" aria-modal="true" aria-label="Settings">
+    <div class="settings-header">
+      <div class="settings-title">Settings</div>
+      <button class="settings-close" onclick="closeSettings()" aria-label="Close settings">×</button>
+    </div>
+    <div class="settings-body">
+    <div class="settings-section">
+      <div class="settings-section-title">Profile</div>
+      <div class="settings-section-desc">Your name and photo — shown in the topbar and on Home.</div>
+      <div class="settings-profile-row">
+        <div class="settings-avatar-edit" id="settings-avatar-edit" onclick="document.getElementById('settings-avatar-file').click()" title="Change photo"></div>
+        <input type="file" id="settings-avatar-file" accept="image/*" style="display:none">
+        <div class="settings-profile-fields">
+          <label class="settings-field-label" for="settings-name-input">Name</label>
+          <input class="settings-field-input" id="settings-name-input" type="text" maxlength="60" autocomplete="off" placeholder="Your name…">
+        </div>
+      </div>
+      <div class="settings-save-status" id="settings-profile-status"></div>
+    </div>
+    <div class="settings-divider"></div>
+    <div class="settings-section">
+      <div class="settings-section-title">Library</div>
+      <div class="settings-section-desc">Where your beats live. Each subfolder becomes a crate.</div>
+      <label class="settings-field-label" for="settings-folder-input">Music Folder Path</label>
+      <div class="settings-folder-row">
+        <input class="settings-field-input settings-folder-input" id="settings-folder-input" type="text" placeholder="/path/to/albums" autocomplete="off">
+        <button class="settings-browse-btn" id="settings-browse-folder-btn" onclick="browseAlbumsFolder()" type="button">Browse…</button>
+      </div>
+      <div class="settings-save-status" id="settings-folder-status"></div>
+      <button class="settings-save-btn" id="settings-rescan-albums-btn" onclick="rescanAlbums()">Re-scan Library</button>
+      <div class="settings-save-status" id="settings-rescan-albums-status"></div>
+    </div>
+    <div class="settings-divider"></div>
+    <div class="settings-section">
+      <div class="settings-section-title">Ableton Sessions</div>
+      <div class="settings-section-desc">Where your .als project files live. Powers the Career Arc timeline.</div>
+      <label class="settings-field-label" for="settings-ableton-input">Ableton Projects Folder</label>
+      <div class="settings-folder-row">
+        <input class="settings-field-input settings-folder-input" id="settings-ableton-input" type="text" placeholder="/path/to/Ableton Projects" autocomplete="off">
+        <button class="settings-browse-btn" id="settings-browse-ableton-btn" onclick="browseAbletonFolder()" type="button">Browse…</button>
+      </div>
+      <div class="settings-save-status" id="settings-ableton-status"></div>
+      <button class="settings-save-btn" id="settings-reindex-sessions-btn" onclick="reindexSessions()">Re-scan Sessions</button>
+      <div class="settings-save-status" id="settings-reindex-status"></div>
+    </div>
+    <div class="settings-divider"></div>
+    <div class="settings-section">
+      <div class="settings-section-title">Playback</div>
+      <div class="settings-toggle-row">
+        <div>
+          <div class="settings-field-label">Volume Normalization</div>
+          <div class="settings-toggle-desc">Analyzes your library and matches loudness across tracks.</div>
+        </div>
+        <label class="settings-toggle-switch">
+          <input type="checkbox" id="normalization-toggle" onchange="toggleNormalization()">
+          <span class="settings-toggle-track"></span>
+        </label>
+      </div>
+      <div class="settings-save-status" id="normalization-status"></div>
+    </div>
+    <div class="settings-divider"></div>
+    <div class="settings-section">
+      <div class="settings-section-title">About</div>
+      <div class="settings-about-row">
+        <div class="settings-about-label">Version</div>
+        <div class="settings-about-value" id="settings-about-version">—</div>
+      </div>
+      <div class="settings-about-row">
+        <div class="settings-about-label">Data folder</div>
+        <div class="settings-about-value settings-about-path" id="settings-about-data-dir">—</div>
+      </div>
+      <button class="settings-browse-btn" id="settings-reveal-data-btn" onclick="revealDataFolder()" type="button" style="margin-top:14px">Reveal in Finder</button>
+    </div>
+    </div>
+  </div>
+</div>
+
+<!-- SEARCH MODAL -->
+<div class="search-backdrop" id="search-backdrop" aria-hidden="true">
+  <div class="search-card" id="search-card" role="dialog" aria-modal="true" aria-label="Search">
+    <div class="search-input-row">
+      <svg class="search-input-icon" width="16" height="16" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+        <circle cx="7.5" cy="7.5" r="5" stroke="currentColor" stroke-width="1.6"/>
+        <line x1="11.4" y1="11.4" x2="16" y2="16" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+      </svg>
+      <input class="search-input" id="search-modal-input" type="text" placeholder="Search beats, tags, crates…" autocomplete="off" spellcheck="false">
+      <span class="search-kbd-hint">esc</span>
+    </div>
+    <div class="search-results" id="search-results"></div>
+  </div>
+</div>
+
+<!-- Global toast stack (auto-dismiss banners). The app's only general notification surface. -->
+<div id="toast-stack" class="toast-stack" aria-live="polite"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

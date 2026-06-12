@@ -1,0 +1,46 @@
+[package]
+name = "beatcrate"
+version = "1.0.0"
+description = "Browse, preview, and organize beat packs"
+authors = ["Andrew Foster"]
+edition = "2021"
+
+[lib]
+# `_lib` suffix keeps the lib name distinct from the bin on Windows (cargo#8519).
+name = "beatcrate_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Own libsqlite3 (no system dep), matching the VST3 plugin's vendored-amalgamation
+# philosophy. First build is slow; incrementals are fast.
+rusqlite = { version = "0.40.0", features = ["bundled"] }
+# Local-time week/all-time boundary math (replaces the Express routes' JS Date
+# logic) + avatar filename timestamps. "clock" pulls in the Local timezone.
+chrono = { version = "0.4", features = ["clock"] }
+# Decode data-URL avatar uploads (POST /api/profile/avatar).
+base64 = "0.22"
+# Task #4 (ingestion + .als index + loudness), all pure-Rust — no ffmpeg/Node:
+flate2 = "1"                 # gunzip .als (was Node zlib)
+roxmltree = "0.21"           # read-only DOM walk of the .als XML (was fast-xml-parser)
+ebur128 = "0.1"              # integrated-loudness measurement (was ffmpeg ebur128 filter)
+lofty = "0.24"               # track duration via metadata (was music-metadata)
+# Decode audio to PCM to feed ebur128. "all" enables every format/codec incl.
+# AIFF (riff) + WAV + MP3 + FLAC + ALAC/AAC (m4a) + Vorbis (ogg).
+symphonia = { version = "0.5", features = ["all"] }
+notify-debouncer-mini = "0.7.0"
+
+[profile.release]
+# Strip symbols from the shipped binary. The build-path/username string leak is
+# closed separately via --remap-path-prefix in .cargo/config.toml (gitignored).
+strip = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
