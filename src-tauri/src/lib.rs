@@ -29,6 +29,28 @@ pub fn notify(app: &tauri::AppHandle, message: &str, kind: &str) {
     }
 }
 
+/// Follow-up for an ingest that found changed audio (a track re-exported over its
+/// own path). The row survived — its measurements didn't:
+///   1. re-measure loudness, since `ingestion` nulled `replay_gain` and the only
+///      other trigger is the Settings normalization toggle;
+///   2. tell the renderer to drop the decoded AudioBuffers it's holding for those
+///      tracks, or a swap made while the app is open keeps playing the old audio
+///      from cache for the rest of the session.
+/// No-op when nothing changed, which is the overwhelmingly common case.
+pub(crate) fn after_ingest(app: &tauri::AppHandle, invalidated: &[i64]) {
+    if invalidated.is_empty() {
+        return;
+    }
+    if let Err(e) = app.emit("beatcrate-tracks-changed", serde_json::json!(invalidated)) {
+        eprintln!("[ingest] tracks-changed emit failed: {e}");
+    }
+    let started = commands::start_analysis_if_idle(app);
+    println!(
+        "[ingest] {} track(s) changed on disk; loudness re-analysis queued for {started}",
+        invalidated.len()
+    );
+}
+
 pub struct AppState {
     pub db: Mutex<Connection>,
     /// Epoch-millis of the last successful ingest. Read by weekly-stats for the
@@ -248,11 +270,12 @@ pub(crate) fn start_albums_watcher(
                 ingestion::ingest_albums_folder(&mut conn, &folder)
             };
             match result {
-                Ok(()) => {
+                Ok(invalidated) => {
                     if let Ok(mut ls) = state.last_sync.lock() {
                         *ls = Some(chrono::Local::now().timestamp_millis());
                     }
                     println!("[watcher] re-ingest complete");
+                    after_ingest(&app, &invalidated);
                 }
                 // H5/M5: the busy_timeout handles the common VST3-lock case, but a
                 // lock that outlasts it — or an unreadable/missing music folder —
@@ -310,11 +333,16 @@ pub fn run() {
         )
         .ok();
     let watch_folder = configured_folder.filter(|f| !f.is_empty());
+    // Files re-exported while the app was closed. Acted on in setup() — the
+    // follow-up needs an AppHandle, which doesn't exist until the builder runs.
+    let mut startup_invalidated: Vec<i64> = Vec::new();
     if let Some(folder) = &watch_folder {
-        if let Err(e) = ingestion::ingest_albums_folder(&mut conn, folder) {
-            eprintln!("[startup-ingest] failed: {e}");
-        } else {
-            last_sync = Some(chrono::Local::now().timestamp_millis());
+        match ingestion::ingest_albums_folder(&mut conn, folder) {
+            Err(e) => eprintln!("[startup-ingest] failed: {e}"),
+            Ok(invalidated) => {
+                startup_invalidated = invalidated;
+                last_sync = Some(chrono::Local::now().timestamp_millis());
+            }
         }
     }
 
@@ -361,6 +389,11 @@ pub fn run() {
                     Err(e) => eprintln!("[watcher] failed to start: {e}"),
                 }
             }
+
+            // Re-measure anything the startup ingest found changed on disk. (The
+            // buffer-cache event it also emits is a no-op this early — nothing is
+            // cached yet — but the analysis kick is the point.)
+            after_ingest(app.handle(), &startup_invalidated);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

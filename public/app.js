@@ -989,6 +989,36 @@ async function setupBackendNoticeListener() {
   }
 }
 
+// A track re-exported over its own path keeps its DB row (and its id), so the
+// decoded AudioBuffer sitting in audioBufferCache would keep playing the OLD
+// audio for the rest of the session. The ingest emits `beatcrate-tracks-changed`
+// with the affected ids; drop those buffers so the next play re-fetches. The
+// track playing right now is left alone mid-playback — its buffer is dropped too,
+// so it picks up the new audio on the next play.
+async function setupTracksChangedListener() {
+  try {
+    const ev = window.__TAURI__ && window.__TAURI__.event;
+    if (!ev || !ev.listen) return;
+    await ev.listen('beatcrate-tracks-changed', e => {
+      const ids = (e && e.payload) || [];
+      if (!Array.isArray(ids)) return;
+      for (const id of ids) audioBufferCache.delete(id);
+      // The in-memory track objects still carry the replay_gain measured off the
+      // OLD audio; applying it to the new audio is a quietly wrong number. Clear
+      // it so playback runs unnormalized until the re-analysis result is fetched.
+      const stale = new Set(ids);
+      for (const list of [state.tracks, state.playingQueue]) {
+        for (const t of (list || [])) if (stale.has(t.id)) t.replay_gain = null;
+      }
+      if (state.playingTrackId && stale.has(state.playingTrackId)) {
+        applyNormGain((state.playingQueue || []).find(t => t.id === state.playingTrackId) || null);
+      }
+    });
+  } catch (err) {
+    console.error('tracks-changed listener setup failed:', err);
+  }
+}
+
 // Wires blur + Enter on a settings input so changes commit without a Save button.
 // `saveFn(trimmedValue, statusEl)` is only called when the value actually changed.
 function wireAutoSaveInput(inputId, statusElId, saveFn) {
@@ -2212,11 +2242,11 @@ function hwPlayTrack(trackId, prefix) {
   jukeboxUpdatePbIcon();
   hwQueueActive = true;
   hwTopTracks = tracks;
-  state.playingQueue = tracks.map(x => ({ id: x.track_id, title: x.title, crate_id: x.crate_id, crate_name: x.crate_name }));
+  state.playingQueue = tracks.map(x => ({ ...x, id: x.track_id }));
   state.playingIndex = tracks.indexOf(t);
   state.playingCrate = null;
   loadAndPlay(
-    { id: t.track_id, title: t.title, crate_id: t.crate_id, crate_name: t.crate_name },
+    { ...t, id: t.track_id },
     { id: t.crate_id, name: t.crate_name }
   );
 }
@@ -4617,5 +4647,6 @@ function bootApp() {
 }
 
 setupBackendNoticeListener();
+setupTracksChangedListener();
 bootApp();
 

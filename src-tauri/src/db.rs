@@ -241,6 +241,17 @@ pub(crate) fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     // no-op once every row carries a value. (audit M4, 2026-05-31)
     backfill_null_list_sort_order(conn)?;
 
+    // Content fingerprint + prune-grace stamps. A track re-exported over its own
+    // path keeps its row (and its notes/tags/plays/sort_order); the fingerprint is
+    // what tells the ingest the bytes changed so it can re-measure. NULL fingerprint
+    // means "never recorded" — the ingest adopts it silently rather than treating
+    // every pre-migration row as changed. (No backfill here: reading mtime/size for
+    // the whole library at migration time would duplicate the ingest's own scan.)
+    try_exec(conn, "ALTER TABLE tracks ADD COLUMN file_mtime INTEGER");
+    try_exec(conn, "ALTER TABLE tracks ADD COLUMN file_size INTEGER");
+    try_exec(conn, "ALTER TABLE tracks ADD COLUMN missing_since INTEGER");
+    try_exec(conn, "ALTER TABLE crates ADD COLUMN emptied_since INTEGER");
+
     // Drop the deprecated crate_tags table (crate-level tagging was removed).
     try_exec(conn, "DROP TABLE IF EXISTS crate_tags");
 

@@ -645,7 +645,7 @@ pub fn list_all_tracks(state: tauri::State<AppState>) -> CmdResult<Vec<Value>> {
         let mut stmt = conn
             .prepare(
                 "SELECT t.id, t.title, t.crate_id, c.name AS crate_name,
-                        t.duration, t.sort_order, t.favorited
+                        t.duration, t.sort_order, t.favorited, t.replay_gain
                  FROM tracks t JOIN crates c ON c.id = t.crate_id
                  ORDER BY c.name ASC, t.sort_order ASC",
             )
@@ -660,6 +660,10 @@ pub fn list_all_tracks(state: tauri::State<AppState>) -> CmdResult<Vec<Value>> {
                     "duration": r.get::<_, Option<f64>>("duration")?,
                     "sort_order": r.get::<_, Option<i64>>("sort_order")?,
                     "favorited": r.get::<_, i64>("favorited")?,
+                    // Playback normalization reads replay_gain off the track object it
+                    // was handed; without it here, anything played from Library plays
+                    // unnormalized while the same track normalizes from crate detail.
+                    "replay_gain": r.get::<_, Option<f64>>("replay_gain")?,
                 }))
             })
             .map_err(err)?;
@@ -1144,9 +1148,12 @@ fn top_tracks_between(
             "crate_id": r.get::<_, i64>("crate_id")?,
             "crate_name": r.get::<_, String>("crate_name")?,
             "plays": r.get::<_, i64>("plays")?,
+            // Same reason as list_all_tracks: hwPlayTrack plays straight off these rows.
+            "replay_gain": r.get::<_, Option<f64>>("replay_gain")?,
         }))
     };
-    let base = "SELECT pl.track_id, t.title, t.crate_id, c.name AS crate_name, COUNT(*) AS plays
+    let base = "SELECT pl.track_id, t.title, t.crate_id, c.name AS crate_name, t.replay_gain,
+                       COUNT(*) AS plays
                 FROM play_log pl
                 JOIN tracks t ON t.id = pl.track_id
                 JOIN crates c ON c.id = t.crate_id";
@@ -1528,8 +1535,9 @@ pub fn set_albums_folder(
     if let Err(e) = app.asset_protocol_scope().allow_directory(&path, true) {
         eprintln!("[asset-scope] failed to allow albums folder {path}: {e}");
     }
-    ingestion::ingest_albums_folder(&mut conn, &path)?;
+    let invalidated = ingestion::ingest_albums_folder(&mut conn, &path)?;
     drop(conn);
+    crate::after_ingest(&app, &invalidated);
     // M4: stamp last_sync so the Home/Library "synced" readout reflects this manual
     // scan (the startup ingest + watcher already do this; these commands didn't).
     touch_last_sync(&state);
@@ -1551,10 +1559,10 @@ pub fn set_albums_folder(
 /// POST /api/config/rescan-albums — re-ingest the configured folder (the Settings
 /// "Re-scan Library" button). Returns fresh crate/track counts.
 #[tauri::command]
-pub fn rescan_albums(state: tauri::State<AppState>) -> CmdResult<Value> {
+pub fn rescan_albums(app: tauri::AppHandle, state: tauri::State<AppState>) -> CmdResult<Value> {
     let mut conn = state.db.lock().map_err(err)?;
     let folder = albums_folder(&conn)?.ok_or("Music Folder is not configured.")?;
-    ingestion::ingest_albums_folder(&mut conn, &folder)?;
+    let invalidated = ingestion::ingest_albums_folder(&mut conn, &folder)?;
     let crates: i64 = conn
         .query_row("SELECT COUNT(*) FROM crates", [], |r| r.get(0))
         .map_err(err)?;
@@ -1562,6 +1570,7 @@ pub fn rescan_albums(state: tauri::State<AppState>) -> CmdResult<Value> {
         .query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0))
         .map_err(err)?;
     drop(conn);
+    crate::after_ingest(&app, &invalidated);
     touch_last_sync(&state); // M4: manual re-scan updates the synced readout too.
     Ok(json!({ "ok": true, "crates": crates, "tracks": tracks }))
 }
@@ -1645,6 +1654,61 @@ pub fn analyze_all(app: tauri::AppHandle, state: tauri::State<AppState>) -> CmdR
     }
 
     Ok(json!({ "ok": true, "total": count, "done": count == 0 }))
+}
+
+/// Start the loudness worker for any track with a NULL replay_gain, unless a job
+/// is already running. Returns how many tracks the worker picked up (0 = nothing
+/// to do, or already running).
+///
+/// The ingest paths call this: a re-exported file has its replay_gain nulled by
+/// `ingestion`, and without a kick here it would stay unmeasured until the user
+/// happened to toggle normalization in Settings (the only other trigger). Runs
+/// regardless of that toggle — only invalidated files decode, so the cost is
+/// bounded by what actually changed on disk.
+pub(crate) fn start_analysis_if_idle(app: &tauri::AppHandle) -> i64 {
+    let state = app.state::<AppState>();
+
+    {
+        let job = match state.analysis.lock() {
+            Ok(j) => j,
+            Err(_) => return 0,
+        };
+        if let Some(j) = job.as_ref() {
+            if j.running {
+                return 0;
+            }
+        }
+    }
+
+    let count: i64 = {
+        let conn = match state.db.lock() {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        conn.query_row(
+            "SELECT COUNT(*) FROM tracks WHERE replay_gain IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    };
+    if count == 0 {
+        return 0;
+    }
+
+    if let Ok(mut job) = state.analysis.lock() {
+        *job = Some(AnalysisJob {
+            running: true,
+            total: count,
+            completed: 0,
+            failed: 0,
+            done: false,
+        });
+    }
+
+    let app = app.clone();
+    std::thread::spawn(move || run_analysis(app));
+    count
 }
 
 /// Worker: decode + measure each NULL-replay_gain track, updating the DB and the
