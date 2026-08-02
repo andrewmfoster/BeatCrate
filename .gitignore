@@ -21,6 +21,11 @@ docs/AUDIT_CODEX_2026-05-31.md
 # Project genealogy + machine-specific notes — local companion to CLAUDE.md
 CLAUDE.local.md
 
+# Local marketing/distribution assets (Gumroad uploads) — not part of the app/plugin repo
+icon/beatcrate-icon-1024.png
+/BeatCrate.dmg
+/BeatCrate-plugin-VST3-AU.zip
+
 # OS
 .DS_Store
 

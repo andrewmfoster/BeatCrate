@@ -18,13 +18,14 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND DEFINED ENV{HOME})
     add_compile_options(-ffile-prefix-map=$ENV{HOME}=/build)
 endif()
 
-# Locate JUCE. Default: sibling checkout at ../../JUCE relative to this file
-# (i.e. ~/Documents/ClaudeCodeVault/JUCE). Override with -DJUCE_PATH=... or env.
+# Locate JUCE. Default: per-project checkout at ../JUCE relative to this file
+# (i.e. apps/BeatCrate/JUCE). Not vendored yet — clone/copy JUCE there before
+# building the plugin, or override with -DJUCE_PATH=... or env $JUCE_PATH.
 if(NOT DEFINED JUCE_PATH)
     if(DEFINED ENV{JUCE_PATH})
         set(JUCE_PATH "$ENV{JUCE_PATH}")
     else()
-        set(JUCE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../JUCE")
+        set(JUCE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../JUCE")
     endif()
 endif()
 
