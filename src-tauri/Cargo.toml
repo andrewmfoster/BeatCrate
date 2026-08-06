@@ -1,6 +1,6 @@
 [package]
 name = "beatcrate"
-version = "1.0.0"
+version = "1.0.1"
 description = "Browse, preview, and organize beat packs"
 authors = ["Andrew Foster"]
 edition = "2021"
