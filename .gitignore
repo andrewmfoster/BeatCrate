@@ -26,6 +26,11 @@ icon/beatcrate-icon-1024.png
 /BeatCrate.dmg
 /BeatCrate-plugin-VST3-AU.zip
 
+# JUCE checkout for the plugin build — a pinned upstream clone, never committed.
+# It is AGPLv3/commercial dual-licensed; this repo is MIT, so the source stays out.
+# Recreate with: git clone --depth 1 --branch 8.0.12 https://github.com/juce-framework/JUCE.git JUCE
+/JUCE/
+
 # OS
 .DS_Store
 

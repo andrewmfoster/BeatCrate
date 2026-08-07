@@ -19,8 +19,11 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND DEFINED ENV{HOME})
 endif()
 
 # Locate JUCE. Default: per-project checkout at ../JUCE relative to this file
-# (i.e. apps/BeatCrate/JUCE). Not vendored yet — clone/copy JUCE there before
-# building the plugin, or override with -DJUCE_PATH=... or env $JUCE_PATH.
+# (i.e. apps/BeatCrate/JUCE), pinned to the 8.0.12 tag and gitignored — it is
+# AGPLv3/commercial dual-licensed and this repo is MIT, so it is never committed.
+# A fresh clone needs it restored before the plugin will build:
+#   git clone --depth 1 --branch 8.0.12 https://github.com/juce-framework/JUCE.git JUCE
+# Override with -DJUCE_PATH=... or env $JUCE_PATH.
 if(NOT DEFINED JUCE_PATH)
     if(DEFINED ENV{JUCE_PATH})
         set(JUCE_PATH "$ENV{JUCE_PATH}")
