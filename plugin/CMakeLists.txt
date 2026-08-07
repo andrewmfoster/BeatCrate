@@ -92,3 +92,17 @@ target_link_libraries(BeatCrate PRIVATE
 # Strip local symbols from the binary (size + privacy). Mirrors the app's strip=true.
 # -x removes local symbols only; exported VST3 entry points (global) are preserved.
 target_link_options(BeatCrate PRIVATE -Wl,-x)
+
+# Re-seal the bundles after JUCE finishes with them. JUCE signs the .vst3 and THEN
+# regenerates Contents/Resources/moduleinfo.json, which invalidates the seal
+# ("a sealed resource is missing or invalid"); Ableton silently rejects the plugin
+# on rescan, so a broken build looks like a build that simply never appears.
+# Registered after juce_add_plugin so these run last in the POST_BUILD chain.
+foreach(_fmt VST3 AU)
+    if(TARGET BeatCrate_${_fmt})
+        add_custom_command(TARGET BeatCrate_${_fmt} POST_BUILD
+            COMMAND codesign --force --deep --sign - "$<TARGET_BUNDLE_DIR:BeatCrate_${_fmt}>"
+            COMMENT "Re-sealing ${_fmt} bundle (JUCE breaks the seal writing moduleinfo.json)"
+            VERBATIM)
+    endif()
+endforeach()

@@ -118,7 +118,9 @@ Ships **unsigned, aarch64-only, local-only.** Username is scrubbed from the bina
 
 **⚠️ Bundle-only CSP gotcha (cost a debug cycle):** the renderer uses inline `on*=` handlers everywhere (~54 of them). On *bundling* (not dev) Tauri injects a script nonce, and per CSP spec a present nonce makes `'unsafe-inline'` ignored → every inline handler is refused → the app boots but is totally inert. Fix already in place: `app.security.dangerousDisableAssetCspModification: ["script-src","style-src"]` in `tauri.conf.json`. This is why you must smoke-test the real bundle, not just `tauri dev`.
 
-**⚠️ Plugin VST3 codesign seal:** the JUCE Release build signs the `.vst3` then regenerates `Contents/Resources/moduleinfo.json` after, breaking the codesign seal — hosts (e.g. Ableton 12) then silently reject the VST3 on scan. Re-sign after building: `codesign --force --deep --sign - <bundle>`.
+**⚠️ Plugin VST3 codesign seal — fixed in CMakeLists, don't remove:** JUCE signs the `.vst3`, then regenerates `Contents/Resources/moduleinfo.json`, breaking the seal — hosts (Ableton 12) silently reject the plugin on scan, so a broken build looks like one that never appeared. `plugin/CMakeLists.txt` re-seals both bundles in a `POST_BUILD` step. Delete it and every rebuild reships a rejected VST3.
+
+**⚠️ Two download surfaces — update both or neither.** The GitHub release asset must be named `BeatCrate.dmg`: the README links `releases/latest/download/BeatCrate.dmg`, and Tauri's native `BeatCrate_<ver>_aarch64.dmg` silently 404s it. The same dmg also has to be re-uploaded to the Gumroad listing. A stale copy on either surface downloads and runs fine — it just isn't the version you shipped.
 
 ---
 *Project history, internal audit/port docs, and machine-specific config live in the gitignored `CLAUDE.local.md` (not published).*
