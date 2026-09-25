@@ -345,6 +345,17 @@
         </label>
       </div>
       <div class="settings-save-status" id="normalization-status"></div>
+      <div class="settings-toggle-row">
+        <div>
+          <div class="settings-field-label">Static Background</div>
+          <div class="settings-toggle-desc">Freezes the animated background to save GPU.</div>
+        </div>
+        <label class="settings-toggle-switch">
+          <input type="checkbox" id="static-bg-toggle" onchange="toggleStaticBackground()">
+          <span class="settings-toggle-track"></span>
+        </label>
+      </div>
+      <div class="settings-save-status" id="static-bg-status"></div>
     </div>
     <div class="settings-divider"></div>
     <div class="settings-section">

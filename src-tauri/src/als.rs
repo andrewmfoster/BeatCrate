@@ -331,6 +331,19 @@ pub fn index_als_root(
     conn: &mut Connection,
     root: &str,
 ) -> Result<(i64, Vec<String>, i64), String> {
+    let scan = scan_als_root(root)?;
+    apply_als_scan(conn, scan)
+}
+
+/// Every .als under a root, parsed. Touches no DB, so callers run it without
+/// holding the app's DB Mutex (A2, 09-23 audit H2).
+pub struct AlsScan {
+    on_disk: std::collections::HashSet<String>,
+    parsed: Vec<(String, AlsMeta)>,
+    failed: Vec<String>,
+}
+
+pub fn scan_als_root(root: &str) -> Result<AlsScan, String> {
     let files = find_als_files(Path::new(root))?;
     // Full path set of every .als on disk (parsed or not) — the prune keyset.
     let on_disk: std::collections::HashSet<String> = files
@@ -353,7 +366,23 @@ pub fn index_als_root(
             }
         }
     }
+    Ok(AlsScan {
+        on_disk,
+        parsed,
+        failed,
+    })
+}
 
+/// Write a scan into als_project_index and prune rows whose .als is gone.
+pub fn apply_als_scan(
+    conn: &mut Connection,
+    scan: AlsScan,
+) -> Result<(i64, Vec<String>, i64), String> {
+    let AlsScan {
+        on_disk,
+        parsed,
+        failed,
+    } = scan;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     for (path, meta) in &parsed {
         upsert_one(&tx, path, meta)?;

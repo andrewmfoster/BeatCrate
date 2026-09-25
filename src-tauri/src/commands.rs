@@ -157,6 +157,7 @@ pub fn set_config_value(
 ) -> CmdResult<Value> {
     let valid = match key.as_str() {
         "normalization_enabled"
+        | "static_background"
         | "todo_collapsed"
         | "scratchpad_collapsed"
         | "timeline_collapsed" => value == "0" || value == "1",
@@ -1577,10 +1578,22 @@ pub fn rescan_albums(app: tauri::AppHandle, state: tauri::State<AppState>) -> Cm
 
 /// POST /api/insights/reindex — re-scan the configured Ableton root, refreshing
 /// als_project_index (powers the Career Arc / Insights views).
+///
+/// Async + spawn_blocking: a sync command runs on the main thread, so parsing
+/// every project there froze the window for the whole scan even with the DB
+/// Mutex released.
 #[tauri::command]
-pub fn reindex_als(state: tauri::State<AppState>) -> CmdResult<Value> {
-    let mut conn = state.db.lock().map_err(err)?;
-    let root: Option<String> = conn
+pub async fn reindex_als(app: tauri::AppHandle) -> CmdResult<Value> {
+    tauri::async_runtime::spawn_blocking(move || reindex_als_blocking(&app.state::<AppState>()))
+        .await
+        .map_err(err)?
+}
+
+fn reindex_als_blocking(state: &AppState) -> CmdResult<Value> {
+    let root: Option<String> = state
+        .db
+        .lock()
+        .map_err(err)?
         .query_row(
             "SELECT value FROM config WHERE key = 'ableton_root'",
             [],
@@ -1590,7 +1603,13 @@ pub fn reindex_als(state: tauri::State<AppState>) -> CmdResult<Value> {
         .map_err(err)?
         .filter(|s| !s.is_empty());
     let root = root.ok_or("Ableton Projects Folder is not configured.")?;
-    let (scanned, failed, pruned) = als::index_als_root(&mut conn, &root)?;
+    // A2: gunzip + parse every project with the DB Mutex released; take it only
+    // for the writes, so other commands don't queue behind the parse.
+    let scan = als::scan_als_root(&root)?;
+    let (scanned, failed, pruned) = {
+        let mut conn = state.db.lock().map_err(err)?;
+        als::apply_als_scan(&mut conn, scan)?
+    };
     // M10: surface the failed names (not just a count) so the renderer can list
     // which projects wouldn't parse. `pruned` = orphan rows removed.
     Ok(json!({
@@ -1609,21 +1628,24 @@ pub fn reindex_als(state: tauri::State<AppState>) -> CmdResult<Value> {
 /// thread as a background job; the renderer polls analyze_status.
 #[tauri::command]
 pub fn analyze_all(app: tauri::AppHandle, state: tauri::State<AppState>) -> CmdResult<Value> {
+    // L3: check `running` and claim the job under ONE analysis-lock hold, or a
+    // concurrent start_analysis_if_idle can slip in between and spawn a second
+    // worker. Nests analysis → db. run_analysis's early exits nest db → analysis,
+    // but only while `running` is true, when this returns before touching db.
+    let mut job = state.analysis.lock().map_err(err)?;
+
     // Already running? Return the live job (matches the route's `already_running`).
-    {
-        let job = state.analysis.lock().map_err(err)?;
-        if let Some(j) = job.as_ref() {
-            if j.running {
-                return Ok(json!({
-                    "ok": true,
-                    "already_running": true,
-                    "running": j.running,
-                    "total": j.total,
-                    "completed": j.completed,
-                    "failed": j.failed,
-                    "done": j.done,
-                }));
-            }
+    if let Some(j) = job.as_ref() {
+        if j.running {
+            return Ok(json!({
+                "ok": true,
+                "already_running": true,
+                "running": j.running,
+                "total": j.total,
+                "completed": j.completed,
+                "failed": j.failed,
+                "done": j.done,
+            }));
         }
     }
 
@@ -1637,16 +1659,14 @@ pub fn analyze_all(app: tauri::AppHandle, state: tauri::State<AppState>) -> CmdR
         .map_err(err)?
     };
 
-    {
-        let mut job = state.analysis.lock().map_err(err)?;
-        *job = Some(AnalysisJob {
-            running: count > 0,
-            total: count,
-            completed: 0,
-            failed: 0,
-            done: count == 0,
-        });
-    }
+    *job = Some(AnalysisJob {
+        running: count > 0,
+        total: count,
+        completed: 0,
+        failed: 0,
+        done: count == 0,
+    });
+    drop(job);
 
     if count > 0 {
         let app = app.clone();
@@ -1668,15 +1688,14 @@ pub fn analyze_all(app: tauri::AppHandle, state: tauri::State<AppState>) -> CmdR
 pub(crate) fn start_analysis_if_idle(app: &tauri::AppHandle) -> i64 {
     let state = app.state::<AppState>();
 
-    {
-        let job = match state.analysis.lock() {
-            Ok(j) => j,
-            Err(_) => return 0,
-        };
-        if let Some(j) = job.as_ref() {
-            if j.running {
-                return 0;
-            }
+    // L3: check-and-set under one analysis-lock hold (see analyze_all).
+    let mut job = match state.analysis.lock() {
+        Ok(j) => j,
+        Err(_) => return 0,
+    };
+    if let Some(j) = job.as_ref() {
+        if j.running {
+            return 0;
         }
     }
 
@@ -1696,15 +1715,14 @@ pub(crate) fn start_analysis_if_idle(app: &tauri::AppHandle) -> i64 {
         return 0;
     }
 
-    if let Ok(mut job) = state.analysis.lock() {
-        *job = Some(AnalysisJob {
-            running: true,
-            total: count,
-            completed: 0,
-            failed: 0,
-            done: false,
-        });
-    }
+    *job = Some(AnalysisJob {
+        running: true,
+        total: count,
+        completed: 0,
+        failed: 0,
+        done: false,
+    });
+    drop(job);
 
     let app = app.clone();
     std::thread::spawn(move || run_analysis(app));

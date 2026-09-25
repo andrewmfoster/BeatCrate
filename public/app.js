@@ -23,18 +23,26 @@ async function navigateBack() {
   if (navHistoryIndex <= 0) return;
   navHistoryIndex--;
   isNavigatingHistory = true;
-  await replayHistoryEntry(navHistory[navHistoryIndex]);
-  isNavigatingHistory = false;
-  updateNavArrows();
+  try {
+    await replayHistoryEntry(navHistory[navHistoryIndex]);
+  } finally {
+    // A rejected replay must not leave pushHistory a no-op for the session.
+    isNavigatingHistory = false;
+    updateNavArrows();
+  }
 }
 
 async function navigateForward() {
   if (navHistoryIndex >= navHistory.length - 1) return;
   navHistoryIndex++;
   isNavigatingHistory = true;
-  await replayHistoryEntry(navHistory[navHistoryIndex]);
-  isNavigatingHistory = false;
-  updateNavArrows();
+  try {
+    await replayHistoryEntry(navHistory[navHistoryIndex]);
+  } finally {
+    // A rejected replay must not leave pushHistory a no-op for the session.
+    isNavigatingHistory = false;
+    updateNavArrows();
+  }
 }
 
 async function replayHistoryEntry(entry) {
@@ -60,6 +68,7 @@ const state = {
   activeCrate: null,   // crate object currently in detail view
   tracks: [],          // tracks for active crate (or flat list for fav/recent)
   playing: false,
+  loading: false,        // a load/resume is in flight (see setTransport); a press cancels it
   playingTrackId: null,  // id of the track currently loaded in the player
   playingQueue: [],      // queue belonging to the active playback context (never changed by navigation)
   playingIndex: -1,      // index into playingQueue
@@ -67,22 +76,60 @@ const state = {
   inspectorOpen: false,  // whether the inspector panel is visible
   selectedTrackId: null, // track id currently shown in the inspector
   normalizationEnabled: false, // loaded from config on init
+  staticBackground: false,     // freeze the mesh shader to save GPU; loaded from config on init
   pbNoteTrack: null,     // { id, title, notes } cache for the playing track (drives popover + badge)
   pbNotePopoverOpen: false,
 };
 
-// ─── Audio ───────────────────────────────────────────────────────────────────
+// ─── Player ──────────────────────────────────────────────────────────────────
+//
+// Everything that starts, stops or reports playback lives in this section:
+//  • startSource() is the only place a buffer source is created and stopSource() the only
+//    place one is stopped. startSource stops the previous node first, so an orphan node
+//    (audible, unstoppable by pause, skipping the queue when it ends) can't exist (F1).
+//  • playGen is bumped by every play, pause, cancel and stop. Each async play path captures
+//    it before an await and bails when it moved, so a superseded load never starts audio or
+//    touches the transport, not even on failure (F1b).
+//  • setTransport() owns every transport side effect (button, vinyl, Now Playing, focus
+//    audio, idle clock, progress RAF, row glyphs). Change play state through it, never by
+//    hand-copying a subset (F6).
 
-// Web Audio API — gain node for volume control
-const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-const gainNode = audioCtx.createGain();
-gainNode.gain.value = 1.0;
-gainNode.connect(audioCtx.destination);
+// Web Audio API — gain node for volume control, and a normalization gain node upstream of
+// it that applies the per-track replay_gain offset. `let`, not `const`: the whole graph is
+// rebuilt by ensureAudioReady() (AudioBuffers are context-independent, so the cache survives).
+let audioCtx, gainNode, normGainNode;
+function buildAudioGraph(volume) {
+  if (audioCtx) audioCtx.close().catch(() => {});
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  gainNode = audioCtx.createGain();
+  gainNode.gain.value = volume;
+  gainNode.connect(audioCtx.destination);
+  normGainNode = audioCtx.createGain();
+  normGainNode.gain.value = 1.0;
+  normGainNode.connect(gainNode);
+}
+buildAudioGraph(1.0);
 
-// Normalization gain node — sits upstream of gainNode, applies per-track replay_gain offset
-const normGainNode = audioCtx.createGain();
-normGainNode.gain.value = 1.0;
-normGainNode.connect(gainNode);
+// Silent-after-idle fix: left idle, WKWebView's context can come back 'interrupted' (a
+// WebKit-only state the old `=== 'suspended'` check missed; its resume() can hang until the
+// interruption ends) or 'running' but bound to a stale output device after sleep / an output
+// switch — plays with no sound either way. So a play after a long idle gets a fresh context.
+const AUDIO_IDLE_REBUILD_MS = 5 * 60 * 1000;
+let audioIdleSince = 0;           // Date.now() when playback last stopped; 0 while playing
+function markAudioIdle() { audioIdleSince = Date.now(); }
+async function ensureAudioReady() {
+  const idleTooLong = audioIdleSince && Date.now() - audioIdleSince > AUDIO_IDLE_REBUILD_MS;
+  audioIdleSince = 0;
+  if (idleTooLong) buildAudioGraph(gainNode.gain.value);
+  if (audioCtx.state === 'running') return;
+  // Fresh timer per attempt — a shared one is already spent by the second race
+  const resumeWithin = ms => Promise.race([
+    audioCtx.resume().catch(() => {}), new Promise(r => setTimeout(r, ms))]);
+  await resumeWithin(1000);
+  if (audioCtx.state === 'running') return;
+  buildAudioGraph(gainNode.gain.value);
+  await resumeWithin(1000);
+}
 
 // Buffer-based playback state
 const audioBufferCache = new Map(); // trackId → AudioBuffer (pre-decoded)
@@ -99,7 +146,10 @@ function cacheAudioBuffer(trackId, buffer) {
     audioBufferCache.delete(key);
   }
 }
-let currentAudioNode = null;        // active AudioBufferSourceNode
+let currentAudioNode = null;        // active AudioBufferSourceNode (startSource/stopSource only)
+let currentBuffer    = null;        // buffer of the live/paused track, held apart from the cache so
+let currentBufferId  = null;        //   a re-export eviction can't strand resume/seek (F4)
+let playGen          = 0;           // play-request generation (see the section header)
 let pbStartTime   = 0;              // audioCtx.currentTime when current segment started
 let pbStartOffset = 0;              // position in track when current segment started
 let pbDuration    = 0;              // duration of currently loaded track
@@ -107,20 +157,78 @@ let pbTimeRAF     = null;           // requestAnimationFrame handle for progress
 
 let isDraggingSeek = false;
 
-// Drag-and-drop track reorder state
-let dragSrcIndex  = null;
-let dragOverIndex = null;
-let dragOverPos   = null; // 'top' | 'bottom'
+// Create, wire and start a source for `buffer` at `offset`, replacing any live node.
+function startSource(buffer, offset) {
+  stopSource();
+  const gen  = playGen;
+  const node = audioCtx.createBufferSource();
+  node.buffer = buffer;
+  node.connect(normGainNode);
+  // Only the node that is still current, from the generation that started it, may
+  // advance the queue. A stale node's onended does nothing.
+  node.onended = () => {
+    if (node !== currentAudioNode || gen !== playGen) return;
+    onTrackEnded();
+  };
+  currentAudioNode = node;
+  pbStartTime   = audioCtx.currentTime;
+  pbStartOffset = offset;
+  node.start(0, offset);
+}
 
-// Drag-and-drop todo reorder state
-let todoDragSrc  = null;
-let todoDragOver = null;
-let todoDragPos  = null; // 'top' | 'bottom'
+function stopSource() {
+  const node = currentAudioNode;
+  if (!node) return;
+  currentAudioNode = null;
+  node.onended = null;
+  try { node.stop(); } catch (_) {}
+  node.disconnect();
+}
 
-// Drag-and-drop note reorder state
-let noteDragSrc  = null;
-let noteDragOver = null;
-let noteDragPos  = null; // 'top' | 'bottom'
+// The buffer to resume or seek a track from: the transport's own copy first (it survives a
+// cache eviction), then the cache. null means cold, so the caller falls back to loadAndPlay.
+function bufferFor(trackId) {
+  if (currentBuffer && currentBufferId === trackId) return currentBuffer;
+  return audioBufferCache.get(trackId) || null;
+}
+
+// s: 'loading' | 'playing' | 'paused' | 'stopped'. Only 'playing' has a live node.
+// 'loading' shows what a load always has: ⏸ on the transport (and on the active row, so a
+// second press reads as "cancel"), progress frozen, and Now Playing, focus audio and vinyl
+// left as they were, so a track switch mid-play doesn't flicker the menu-bar widget.
+// 'paused' and 'stopped' share side effects; 'stopped' means nothing is left to resume
+// mid-track (end of queue, failed load).
+function setTransport(s) {
+  state.loading = s === 'loading';
+  state.playing = s === 'playing';
+  if (s === 'playing') {
+    audioIdleSince = 0;
+    document.getElementById('btn-play').textContent = '⏸';
+    setVinylSpin(true);
+    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+    startMediaFocus();
+    startPbTimeUpdate();
+  } else {
+    stopSource();
+    cancelAnimationFrame(pbTimeRAF);
+    if (s === 'loading') {
+      document.getElementById('btn-play').textContent = '⏸';
+    } else {
+      document.getElementById('btn-play').textContent = '▶';
+      setVinylSpin(false);
+      // Without this, macOS Now Playing keeps showing ⏸ (the last playbackState set was
+      // 'playing') and the silent focus loop keeps reporting playback (trap 2). Pause the
+      // focus audio, never detach it (trap 3).
+      if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+      pauseMediaFocus();
+      // Keep an older idle stamp: a load cancelled before ensureAudioReady ran must not
+      // reset the clock that decides the idle rebuild.
+      if (!audioIdleSince) markAudioIdle();
+    }
+  }
+  refreshDetailPlayState();
+  jukeboxSyncWidget();
+}
 
 // RAF-based progress update — runs while state.playing is true
 function startPbTimeUpdate() {
@@ -142,6 +250,8 @@ function startPbTimeUpdate() {
 function cueTrackWithoutPlay(track, crate) {
   if (!track) return;
   state.playingTrackId = track.id;
+  currentBuffer = null;
+  currentBufferId = null;
   refreshPbNoteCache();
   pbStartOffset = 0;
   document.getElementById('pb-track-name').textContent = track.title;
@@ -185,26 +295,327 @@ function onTrackEnded() {
         hwQueueActive = false;
         jukeboxDice();
       } else {
-        // Last track finished — stop completely, then cue the first track
-        cancelAnimationFrame(pbTimeRAF);
-        currentAudioNode = null;
-        state.playing = false;
-        document.getElementById('btn-play').textContent = '▶';
-        setVinylSpin(false);
-        // Without this, macOS Now Playing keeps showing ⏸ because the last
-        // playbackState set was 'playing' from updateMediaSession().
-        if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
-        pauseMediaFocus();
-        // Cue first track into transport bar without playing
+        // Last track finished — stop completely, then cue the first track without playing
+        playGen++;
+        setTransport('stopped');
         state.playingIndex = 0;
         cueTrackWithoutPlay(state.playingQueue[0], state.playingCrate);
-        jukeboxSyncWidget();
       }
     } else {
       skipTrack(1);
     }
   }
 }
+
+async function loadAndPlay(track, crate, startOffset = 0) {
+  // New request: any load or resume still in flight is now stale
+  const gen = ++playGen;
+  pbStartOffset = startOffset > 0 ? startOffset : 0;
+
+  // Mark this track as the one being loaded before any await
+  state.playingTrackId = track.id;
+  currentBuffer = null;
+  currentBufferId = null;
+  refreshPbNoteCache();
+
+  // Update UI immediately (title, art, tags)
+  document.getElementById('pb-track-name').textContent = track.title;
+  document.getElementById('pb-crate-name').textContent =
+    crate ? crate.name : (track.crate_name || '');
+  if (crate) setPbArt(crate);
+  else if (track.crate_id) setPbArt({ id: track.crate_id });
+  renderPbTags(track);
+  updatePbStar();
+  document.getElementById('pb-track-info').classList.toggle('active', !!crate || !!track.crate_id);
+  // Stops the previous node immediately so there is no overlap; a press now cancels
+  setTransport('loading');
+
+  // Fetch and decode into an AudioBuffer if not already cached
+  let buffer = audioBufferCache.get(track.id);
+  if (!buffer) {
+    try {
+      const audioPath = await invoke('track_audio_path', { id: track.id });
+      if (gen !== playGen) return;
+      const res = await fetch(convertFileSrc(audioPath));
+      if (gen !== playGen) return;
+      const arrayBuf = await res.arrayBuffer();
+      if (gen !== playGen) return;
+      buffer = await audioCtx.decodeAudioData(arrayBuf);
+      cacheAudioBuffer(track.id, buffer); // still worth caching if superseded
+    } catch (e) {
+      // A superseded load's failure is not the user's problem: touch nothing
+      if (gen !== playGen) return;
+      // Decode failed (file missing/moved on disk, unsupported codec). Reset the
+      // transport so it doesn't show a phantom "playing" state with no audio,
+      // and tell the user why nothing played (M7 surfaces a "file not found").
+      console.error('Audio decode failed for track', track.id, e);
+      playGen++;
+      setTransport('stopped');
+      showToast(`Couldn't play "${track.title || 'this beat'}" — the file may have moved. Try Re-scan Library.`, 'err');
+      return;
+    }
+    // Another track may have been requested (or this load cancelled) while decoding
+    if (gen !== playGen) return;
+  }
+
+  // Resume (or rebuild) the AudioContext — autoplay policy, WebKit interruption, idle
+  await ensureAudioReady();
+  if (gen !== playGen) return;
+
+  // Update duration display from decoded buffer
+  pbDuration = buffer.duration;
+  document.getElementById('pb-duration').textContent = '-' + formatTime(pbDuration);
+
+  // Start the source — buffer is fully decoded, playback is clean.
+  // Honor a pending seek offset (set while paused on a not-yet-decoded track); clamp it
+  // to the real decoded duration so a seek past the end just restarts from 0.
+  const offset = (!(startOffset > 0) || startOffset >= buffer.duration - 0.1) ? 0 : startOffset;
+  currentBuffer = buffer;
+  currentBufferId = track.id;
+  applyNormGain(track);
+  startSource(buffer, offset);
+
+  // Count the play only once audio has actually started: a failed decode or a
+  // load superseded by another track returned above and never gets here.
+  invoke('log_play', { id: track.id })
+    .then(() => refreshStats())
+    .catch(() => {});
+
+  setTransport('playing');
+  updateMediaSession(track, crate);
+
+  // Pre-decode the next track in the queue so its start is also clean
+  const nextIdx = state.playingIndex + 1;
+  if (nextIdx < state.playingQueue.length) {
+    prefetchAudioBuffer(state.playingQueue[nextIdx].id);
+  }
+}
+
+// Fetch and decode a track's audio into the cache in the background
+function prefetchAudioBuffer(trackId) {
+  if (audioBufferCache.has(trackId)) return;
+  invoke('track_audio_path', { id: trackId })
+    .then(p => fetch(convertFileSrc(p)))
+    .then(r => r.arrayBuffer())
+    .then(ab => audioCtx.decodeAudioData(ab))
+    .then(buf => cacheAudioBuffer(trackId, buf))
+    .catch(() => {});
+}
+
+function applyNormGain(track) {
+  if (state.normalizationEnabled && track && track.replay_gain != null) {
+    normGainNode.gain.value = Math.pow(10, track.replay_gain / 20);
+  } else {
+    normGainNode.gain.value = 1.0;
+  }
+}
+
+function setVinylSpin(playing) {
+  const icon = document.querySelector('.titlebar-logo-icon');
+  if (icon) icon.classList.toggle('spinning', playing);
+}
+
+// Sync .playing/.active-playing classes and play button icons for the detail tracklist.
+// The active row's button shows ⏸ while loading too: pressing it then cancels the load.
+function refreshDetailPlayState() {
+  const busy = state.playing || state.loading;
+  document.querySelectorAll('#tracks-list .track-row').forEach(row => {
+    const trackId = parseInt(row.id.replace('track-row-', ''));
+    const isActive = trackId === state.playingTrackId;
+    row.classList.toggle('playing', isActive);
+    row.classList.toggle('active-playing', isActive && state.playing);
+    const btn = row.querySelector('.track-play-btn');
+    if (btn) btn.textContent = (isActive && busy) ? '⏸' : '▶';
+  });
+  document.querySelectorAll('#flat-tracks-list .track-row').forEach(row => {
+    const trackId = parseInt(row.id.replace('flat-track-', ''));
+    const isActive = trackId === state.playingTrackId;
+    row.classList.toggle('playing', isActive);
+    row.classList.toggle('active-playing', isActive && state.playing);
+    const btn = row.querySelector('.track-play-btn');
+    if (btn) btn.textContent = (isActive && busy) ? '⏸' : '▶';
+  });
+  refreshCrateGridPlayState();
+  refreshHwPlayState();
+  refreshSongsPlayState();
+}
+
+async function togglePlay() {
+  if (!state.playingTrackId) return;
+  if (state.loading) {
+    // A press while the track is still loading cancels it: the load's awaits see a new
+    // playGen and bail. Track and saved offset stay, so the next press loads afresh.
+    playGen++;
+    setTransport('paused');
+    return;
+  }
+  if (state.playing) {
+    // Pause: save playback position, stop source node
+    playGen++;
+    pbStartOffset += audioCtx.currentTime - pbStartTime;
+    setTransport('paused');
+    return;
+  }
+  // Resume: a new source node from the saved offset
+  const gen = ++playGen;
+  const buffer = bufferFor(state.playingTrackId);
+  if (!buffer) {
+    // Cold (track was cued without loading) — fetch and play, honoring any seek the
+    // user performed while paused (otherwise the seek would be discarded).
+    const track = state.playingQueue[state.playingIndex];
+    if (track) loadAndPlay(track, state.playingCrate, pbStartOffset);
+    return;
+  }
+  // ensureAudioReady can take ~2 s on an interrupted context; a press meanwhile cancels
+  setTransport('loading');
+  await ensureAudioReady();
+  if (gen !== playGen) return;
+  currentBuffer = buffer;
+  currentBufferId = state.playingTrackId;
+  pbDuration = buffer.duration;
+  applyNormGain(state.playingQueue[state.playingIndex]);
+  startSource(buffer, pbStartOffset);
+  setTransport('playing');
+}
+
+function updateMediaSession(track, crate) {
+  if (!('mediaSession' in navigator)) return;
+  const artist  = (state.profile && state.profile.name) ? state.profile.name : '';
+  const album   = crate ? crate.name : (track.crate_name || '');
+  const crateId = crate ? crate.id  : track.crate_id;
+  const artwork = crateId
+    ? [{ src: crateCoverUrl(crateId), sizes: '512x512', type: 'image/jpeg' }]
+    : [];
+  navigator.mediaSession.metadata = new MediaMetadata({
+    title: track.title || '',
+    artist,
+    album,
+    artwork,
+  });
+  navigator.mediaSession.playbackState = 'playing';
+  if (pbDuration && 'setPositionState' in navigator.mediaSession) {
+    try {
+      navigator.mediaSession.setPositionState({
+        duration: pbDuration,
+        position: pbStartOffset,
+        playbackRate: 1,
+      });
+    } catch (_) {}
+  }
+}
+
+function skipTrack(dir) {
+  if (!state.playingQueue.length) return;
+  const next = state.playingIndex + dir;
+  if (next < 0 || next >= state.playingQueue.length) return;
+  state.playingIndex = next;
+
+  const track = state.playingQueue[next];
+
+  // Update flat list highlight when not in the detail view
+  if (state.currentView !== 'detail') {
+    document.querySelectorAll('#flat-tracks-list .track-row').forEach((r, i) =>
+      r.classList.toggle('playing', i === next)
+    );
+  }
+  // Detail list buttons/highlight updated by loadAndPlay → refreshDetailPlayState
+
+  loadAndPlay(track, state.playingCrate);
+}
+
+function getSeekRatio(e) {
+  const bar = document.getElementById('pb-seek');
+  const rect = bar.getBoundingClientRect();
+  return Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+}
+
+function seekToRatio(ratio) {
+  if (!pbDuration) return;
+  const offset = ratio * pbDuration;
+  document.getElementById('pb-seek-fill').style.width = `${ratio * 100}%`;
+  document.getElementById('pb-current').textContent = formatTime(offset);
+  document.getElementById('pb-duration').textContent = '-' + formatTime(Math.max(0, pbDuration - offset));
+  if (state.playing) {
+    // Restart at the new position from the transport's own buffer, so a re-export that
+    // evicted the cache mid-play can't leave "playing" with no audio (F4)
+    const buffer = bufferFor(state.playingTrackId);
+    if (!buffer) {
+      const track = state.playingQueue[state.playingIndex];
+      if (track) loadAndPlay(track, state.playingCrate, offset);
+      return;
+    }
+    applyNormGain(state.playingQueue[state.playingIndex]);
+    startSource(buffer, offset);
+  } else {
+    pbStartOffset = offset;
+  }
+}
+
+// Chromium drops the page from "media producer" status when Web Audio stops,
+// which lets macOS hand media keys back to whichever app was previously active
+// (typically Apple Music). A silent looping <audio> element preserves focus.
+let _mediaFocusAudio = null;
+function ensureMediaFocusAudio() {
+  if (_mediaFocusAudio) return _mediaFocusAudio;
+  const sampleRate = 8000;
+  const length     = sampleRate;
+  const buf        = new ArrayBuffer(44 + length);
+  const v          = new DataView(buf);
+  v.setUint32(0,  0x52494646, false); // "RIFF"
+  v.setUint32(4,  36 + length, true);
+  v.setUint32(8,  0x57415645, false); // "WAVE"
+  v.setUint32(12, 0x666d7420, false); // "fmt "
+  v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true);           // PCM
+  v.setUint16(22, 1, true);           // mono
+  v.setUint32(24, sampleRate, true);
+  v.setUint32(28, sampleRate, true);
+  v.setUint16(32, 1, true);
+  v.setUint16(34, 8, true);           // 8-bit
+  v.setUint32(36, 0x64617461, false); // "data"
+  v.setUint32(40, length, true);
+  for (let i = 0; i < length; i++) v.setUint8(44 + i, 0x80); // 8-bit unsigned silence
+
+  const url = URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+  const a   = document.createElement('audio');
+  a.src     = url;
+  a.loop    = true;
+  a.volume  = 1;            // data is digital silence; volume>0 keeps Chromium tracking it
+  a.preload = 'auto';
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  _mediaFocusAudio = a;
+  return a;
+}
+function startMediaFocus() {
+  const a = ensureMediaFocusAudio();
+  if (a.paused) a.play().catch(() => {});
+}
+// Pause the silent focus audio so macOS Now Playing reflects the paused state.
+// Without this, Chromium sees the looping <audio> still playing and reports
+// 'playing' to the OS regardless of mediaSession.playbackState, leaving the
+// menu bar widget stuck on ⏸. The element stays on the page so the page
+// retains media-producer status and F8 still routes here on resume.
+function pauseMediaFocus() {
+  if (_mediaFocusAudio && !_mediaFocusAudio.paused) _mediaFocusAudio.pause();
+}
+
+// ─── Player (end) ────────────────────────────────────────────────────────────
+
+// Drag-and-drop track reorder state
+let dragSrcIndex  = null;
+let dragOverIndex = null;
+let dragOverPos   = null; // 'top' | 'bottom'
+
+// Drag-and-drop todo reorder state
+let todoDragSrc  = null;
+let todoDragOver = null;
+let todoDragPos  = null; // 'top' | 'bottom'
+
+// Drag-and-drop note reorder state
+let noteDragSrc  = null;
+let noteDragOver = null;
+let noteDragPos  = null; // 'top' | 'bottom'
 
 // ─── Tauri bridge ────────────────────────────────────────────────────────────
 //
@@ -260,6 +671,7 @@ const API_ROUTES = [
   ['POST',   '/api/config/albums-folder',        'set_albums_folder',     (_, b) => ({ path: b.path })],
   ['POST',   '/api/config/rescan-albums',        'rescan_albums'],
   ['POST',   '/api/config/normalization',        'set_config_value',      (_, b) => ({ key: 'normalization_enabled',  value: String(b.enabled) })],
+  ['POST',   '/api/config/static-background',    'set_config_value',      (_, b) => ({ key: 'static_background',      value: String(b.enabled) })],
   ['POST',   '/api/config/library-mode',         'set_config_value',      (_, b) => ({ key: 'library_mode',           value: b.value })],
   ['POST',   '/api/config/crates-view',          'set_config_value',      (_, b) => ({ key: 'crates_view_mode',       value: b.value })],
   ['POST',   '/api/config/todo-collapsed',       'set_config_value',      (_, b) => ({ key: 'todo_collapsed',         value: b.value })],
@@ -368,6 +780,7 @@ async function init() {
   setupSettingsAutoSave();
   const config = await api('/api/config');
   state.normalizationEnabled = config.normalization_enabled === '1';
+  state.staticBackground = config.static_background === '1';
   const savedCratesView = config.crates_view_mode;
   cratesViewMode = CRATES_VIEW_MODES.includes(savedCratesView) ? savedCratesView : 'all';
   libraryMode = 'crates';
@@ -583,13 +996,21 @@ function _startMeshRAF() {
   if (_meshRafStarted) return;
   _meshRafStarted = true;
   const t0 = performance.now();
+  let frozenAt = null; // static background: the elapsed time the shader is held at
   function frame(now) {
-    const elapsed = (now - t0) / 1000;
+    if (!state.staticBackground) frozenAt = null;
+    else if (frozenAt === null) frozenAt = (now - t0) / 1000;
+    const elapsed = frozenAt !== null ? frozenAt : (now - t0) / 1000;
     for (const ctx of _meshCanvases) {
       if (!_isMeshWrapActive(ctx.wrap)) continue;
       const dpr = Math.min(window.devicePixelRatio || 1, 1.8);
       const cw = Math.max(1, Math.floor(ctx.canvas.clientWidth  * dpr));
       const ch = Math.max(1, Math.floor(ctx.canvas.clientHeight * dpr));
+      // Static: keep polling size (the mesh follows the welcome `bottom` transition) but
+      // only redraw when the frame would differ — resizing a canvas clears it.
+      const drawKey = `${cw}x${ch}@${elapsed}`;
+      if (frozenAt !== null && ctx.drawKey === drawKey) continue;
+      ctx.drawKey = drawKey;
       if (ctx.canvas.width !== cw || ctx.canvas.height !== ch) {
         ctx.canvas.width = cw; ctx.canvas.height = ch;
       }
@@ -882,6 +1303,8 @@ async function showSettings() {
     if (normToggle) normToggle.checked = config.normalization_enabled === '1';
     const normStatus = document.getElementById('normalization-status');
     if (normStatus) { normStatus.textContent = ''; normStatus.className = 'settings-save-status'; }
+    const staticToggle = document.getElementById('static-bg-toggle');
+    if (staticToggle) staticToggle.checked = config.static_background === '1';
   } catch (e) {}
 
   const fileInput = document.getElementById('settings-avatar-file');
@@ -993,8 +1416,9 @@ async function setupBackendNoticeListener() {
 // decoded AudioBuffer sitting in audioBufferCache would keep playing the OLD
 // audio for the rest of the session. The ingest emits `beatcrate-tracks-changed`
 // with the affected ids; drop those buffers so the next play re-fetches. The
-// track playing right now is left alone mid-playback — its buffer is dropped too,
-// so it picks up the new audio on the next play.
+// track playing right now is left alone mid-playback — its cache entry is dropped
+// too, but the transport's currentBuffer keeps pause/resume/seek working (F4);
+// the next fresh load picks up the new audio.
 async function setupTracksChangedListener() {
   try {
     const ev = window.__TAURI__ && window.__TAURI__.event;
@@ -1158,6 +1582,8 @@ async function reindexSessions() {
     if (result.failed > 0) msg += `, ${result.failed} failed`;
     if (result.pruned > 0) msg += `, removed ${result.pruned} deleted`;
     if (statusEl) { statusEl.textContent = msg; statusEl.className = 'settings-save-status ok'; }
+    // The scan runs off the main thread now, so the user may have left Settings: toast it too.
+    showToast(msg);
     // M10: name the projects that wouldn't parse so they're actionable, not just a count.
     const failedFiles = result.failed_files || [];
     if (failedFiles.length) {
@@ -1168,15 +1594,39 @@ async function reindexSessions() {
   } catch (e) {
     const msg = e && e.message ? e.message : 'Ableton Projects Folder is not configured.';
     if (statusEl) { statusEl.textContent = msg; statusEl.className = 'settings-save-status err'; }
+    showToast(msg, 'err');
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = 'Re-scan Sessions'; }
   }
+}
+
+async function toggleStaticBackground() {
+  const toggle = document.getElementById('static-bg-toggle');
+  const statusEl = document.getElementById('static-bg-status');
+  const enabled = toggle.checked;
+  state.staticBackground = enabled; // the mesh loop reads this every frame
+  try {
+    await api('/api/config/static-background', { method: 'POST', body: JSON.stringify({ enabled: enabled ? 1 : 0 }) });
+    statusEl.textContent = '';
+    statusEl.className = 'settings-save-status';
+  } catch (e) {
+    statusEl.textContent = 'Could not save setting.';
+    statusEl.className = 'settings-save-status err';
+  }
+}
+
+// One analyze-status poller for the session: toggling on/off during analysis
+// used to stack a fresh 1.5 s interval per enable.
+let normPollId = null;
+function stopNormPoll() {
+  if (normPollId !== null) { clearInterval(normPollId); normPollId = null; }
 }
 
 async function toggleNormalization() {
   const toggle = document.getElementById('normalization-toggle');
   const statusEl = document.getElementById('normalization-status');
   const enabled = toggle.checked;
+  stopNormPoll();
 
   try {
     await api('/api/config/normalization', { method: 'POST', body: JSON.stringify({ enabled: enabled ? 1 : 0 }) });
@@ -1210,12 +1660,16 @@ async function toggleNormalization() {
     statusEl.textContent = `Analyzing ${result.total} tracks…`;
     statusEl.className = 'settings-save-status';
 
-    // Poll for progress every 1.5 s
-    const pollId = setInterval(async () => {
+    // Poll for progress every 1.5 s; give up after repeated failures rather
+    // than polling a broken status call forever.
+    let pollErrors = 0;
+    stopNormPoll();
+    normPollId = setInterval(async () => {
       try {
         const job = await api('/api/tracks/analyze-status');
+        pollErrors = 0;
         if (job.done) {
-          clearInterval(pollId);
+          stopNormPoll();
           // H2: job.completed now counts only tracks whose gain was actually
           // stored; note any that failed so the count isn't silently short.
           statusEl.textContent = job.failed > 0
@@ -1225,7 +1679,9 @@ async function toggleNormalization() {
         } else {
           statusEl.textContent = `Analyzing tracks… ${job.completed} / ${job.total}`;
         }
-      } catch (_) {}
+      } catch (_) {
+        if (++pollErrors >= 5) stopNormPoll();
+      }
     }, 1500);
   } catch (e) {
     statusEl.textContent = 'Could not save setting.';
@@ -1451,7 +1907,7 @@ function renderSongsTrackList() {
   tracks.forEach((t, idx) => {
     const isPlaying = t.id === state.playingTrackId;
     const isActivelyPlaying = isPlaying && state.playing;
-    const playIcon = isActivelyPlaying ? '⏸' : '▶';
+    const playIcon = (isPlaying && (state.playing || state.loading)) ? '⏸' : '▶';
     html += `
       <div class="track-row${isPlaying ? ' playing' : ''}${isActivelyPlaying ? ' active-playing' : ''}"
            id="songs-row-${t.id}"
@@ -1500,7 +1956,7 @@ function refreshSongsPlayState() {
     row.classList.toggle('active-playing', isActivelyPlaying);
     const playBtn = row.querySelector('.track-play-btn');
     if (playBtn) {
-      playBtn.textContent = isActivelyPlaying ? '⏸' : '▶';
+      playBtn.textContent = (isPlaying && (state.playing || state.loading)) ? '⏸' : '▶';
     }
   });
 }
@@ -2263,7 +2719,7 @@ function refreshHwPlayState() {
     row.classList.toggle('playing', isActive);
     row.classList.toggle('active-playing', isActive && state.playing);
     const btn = row.querySelector('.home-track-play-btn');
-    if (btn) btn.textContent = (isActive && state.playing) ? '⏸' : '▶';
+    if (btn) btn.textContent = (isActive && (state.playing || state.loading)) ? '⏸' : '▶';
   });
 }
 
@@ -2852,7 +3308,7 @@ function refreshCrateGridPlayState() {
     card.classList.toggle('playing', isThisCrate);
     card.classList.toggle('active-playing', isActivePlaying);
     const icon = card.querySelector('.crate-play-icon');
-    if (icon) icon.textContent = isActivePlaying ? '⏸' : '▶';
+    if (icon) icon.textContent = (isThisCrate && (state.playing || state.loading)) ? '⏸' : '▶';
   });
 }
 
@@ -2878,7 +3334,10 @@ function commitBackdrop(content) {
   const backdrop = document.getElementById('detail-backdrop');
   const img      = document.getElementById('detail-backdrop-img');
   if (content.type === 'image') {
-    img.style.backgroundImage = `url(${content.url})`;
+    // Quoted: convertFileSrc leaves ( ) ' unescaped, which break an unquoted
+    // url() token and the assignment is silently dropped.
+    const cssUrl = String(content.url).replace(/["\\]/g, '\\$&');
+    img.style.backgroundImage = `url("${cssUrl}")`;
     img.style.backgroundColor = '';
   } else if (content.type === 'color') {
     img.style.backgroundImage = '';
@@ -3743,7 +4202,7 @@ function renderTrackList(tracks, crate) {
     const isPlaying        = t.id === state.playingTrackId;
     const isSelected       = t.id === state.selectedTrackId;
     const isActivelyPlaying = isPlaying && state.playing;
-    const playIcon         = isActivelyPlaying ? '⏸' : '▶';
+    const playIcon         = (isPlaying && (state.playing || state.loading)) ? '⏸' : '▶';
     return `
       <div class="track-row${isPlaying ? ' playing' : ''}${isActivelyPlaying ? ' active-playing' : ''}${isSelected ? ' selected' : ''}"
            id="track-row-${t.id}" draggable="true">
@@ -3850,14 +4309,18 @@ function attachDragHandlers(listEl, crate) {
     });
   });
 
-  // Clear indicators when drag exits the list container
-  listEl.addEventListener('dragleave', e => {
-    if (!listEl.contains(e.relatedTarget)) {
-      clearDragIndicators(listEl);
-      dragOverIndex = null;
-      dragOverPos   = null;
-    }
-  });
+  // Clear indicators when drag exits the list container. #tracks-list persists
+  // across renders, so register once or a listener piles up per crate open.
+  if (!listEl.dataset.dragleaveWired) {
+    listEl.dataset.dragleaveWired = '1';
+    listEl.addEventListener('dragleave', e => {
+      if (!listEl.contains(e.relatedTarget)) {
+        clearDragIndicators(listEl);
+        dragOverIndex = null;
+        dragOverPos   = null;
+      }
+    });
+  }
 }
 
 async function saveTrackOrder(crateId, orderedIds) {
@@ -3917,279 +4380,7 @@ async function openTrackInspector(index) {
   } catch (_) {}
 }
 
-// ─── Playback ─────────────────────────────────────────────────────────────────
-
-async function loadAndPlay(track, crate, startOffset = 0) {
-  // Stop any currently playing node immediately so there is no overlap
-  if (currentAudioNode) {
-    currentAudioNode.onended = null;
-    try { currentAudioNode.stop(); } catch (_) {}
-    currentAudioNode.disconnect();
-    currentAudioNode = null;
-  }
-  cancelAnimationFrame(pbTimeRAF);
-  pbStartOffset = startOffset > 0 ? startOffset : 0;
-  state.playing = false;
-
-  // Mark this track as the one being loaded before any await
-  state.playingTrackId = track.id;
-  refreshPbNoteCache();
-  invoke('log_play', { id: track.id })
-    .then(() => refreshStats())
-    .catch(() => {});
-
-  // Update UI immediately (title, art, tags)
-  document.getElementById('pb-track-name').textContent = track.title;
-  document.getElementById('pb-crate-name').textContent =
-    crate ? crate.name : (track.crate_name || '');
-  if (crate) setPbArt(crate);
-  else if (track.crate_id) setPbArt({ id: track.crate_id });
-  renderPbTags(track);
-  updatePbStar();
-  document.getElementById('pb-track-info').classList.toggle('active', !!crate || !!track.crate_id);
-  document.getElementById('btn-play').textContent = '⏸';
-  refreshDetailPlayState();
-  jukeboxSyncWidget();
-
-  // Fetch and decode into an AudioBuffer if not already cached
-  let buffer = audioBufferCache.get(track.id);
-  if (!buffer) {
-    try {
-      const audioUrl = convertFileSrc(await invoke('track_audio_path', { id: track.id }));
-      const res = await fetch(audioUrl);
-      const arrayBuf = await res.arrayBuffer();
-      buffer = await audioCtx.decodeAudioData(arrayBuf);
-      cacheAudioBuffer(track.id, buffer);
-    } catch (e) {
-      // Decode failed (file missing/moved on disk, unsupported codec). Reset the
-      // transport UI so it doesn't show a phantom "playing" state with no audio,
-      // and tell the user why nothing played (M7 surfaces a "file not found").
-      console.error('Audio decode failed for track', track.id, e);
-      state.playing = false;
-      document.getElementById('btn-play').textContent = '▶';
-      setVinylSpin(false);
-      cancelAnimationFrame(pbTimeRAF);
-      refreshDetailPlayState();
-      jukeboxSyncWidget();
-      showToast(`Couldn't play "${track.title || 'this beat'}" — the file may have moved. Try Re-scan Library.`, 'err');
-      return;
-    }
-  }
-
-  // Another track may have been requested while we were decoding — abort if so
-  if (state.playingTrackId !== track.id) return;
-
-  // Resume AudioContext if suspended (browser autoplay policy)
-  if (audioCtx.state === 'suspended') await audioCtx.resume();
-
-  // Update duration display from decoded buffer
-  pbDuration = buffer.duration;
-  document.getElementById('pb-duration').textContent = '-' + formatTime(pbDuration);
-
-  // Create and start source node — buffer is fully decoded, playback is clean.
-  // Honor a pending seek offset (set while paused on a not-yet-decoded track); clamp it
-  // to the real decoded duration so a seek past the end just restarts from 0.
-  if (!(startOffset > 0) || startOffset >= buffer.duration - 0.1) pbStartOffset = 0;
-  else pbStartOffset = startOffset;
-  currentAudioNode = audioCtx.createBufferSource();
-  currentAudioNode.buffer = buffer;
-  currentAudioNode.connect(normGainNode);
-  currentAudioNode.onended = onTrackEnded;
-  applyNormGain(track);
-  pbStartTime = audioCtx.currentTime;
-  currentAudioNode.start(0, pbStartOffset);
-
-  state.playing = true;
-  document.getElementById('btn-play').textContent = '⏸';
-  setVinylSpin(true);
-
-  startMediaFocus();
-  updateMediaSession(track, crate);
-
-  refreshDetailPlayState();
-  jukeboxSyncWidget();
-
-  // Start position update loop
-  startPbTimeUpdate();
-
-  // Pre-decode the next track in the queue so its start is also clean
-  const nextIdx = state.playingIndex + 1;
-  if (nextIdx < state.playingQueue.length) {
-    prefetchAudioBuffer(state.playingQueue[nextIdx].id);
-  }
-}
-
-// Fetch and decode a track's audio into the cache in the background
-function prefetchAudioBuffer(trackId) {
-  if (audioBufferCache.has(trackId)) return;
-  invoke('track_audio_path', { id: trackId })
-    .then(p => fetch(convertFileSrc(p)))
-    .then(r => r.arrayBuffer())
-    .then(ab => audioCtx.decodeAudioData(ab))
-    .then(buf => cacheAudioBuffer(trackId, buf))
-    .catch(() => {});
-}
-
-function applyNormGain(track) {
-  if (state.normalizationEnabled && track && track.replay_gain != null) {
-    normGainNode.gain.value = Math.pow(10, track.replay_gain / 20);
-  } else {
-    normGainNode.gain.value = 1.0;
-  }
-}
-
-function setVinylSpin(playing) {
-  const icon = document.querySelector('.titlebar-logo-icon');
-  if (icon) icon.classList.toggle('spinning', playing);
-}
-
-// Sync .playing/.active-playing classes and play button icons for the detail tracklist
-function refreshDetailPlayState() {
-  document.querySelectorAll('#tracks-list .track-row').forEach(row => {
-    const trackId = parseInt(row.id.replace('track-row-', ''));
-    const isActive = trackId === state.playingTrackId;
-    row.classList.toggle('playing', isActive);
-    row.classList.toggle('active-playing', isActive && state.playing);
-    const btn = row.querySelector('.track-play-btn');
-    if (btn) btn.textContent = (isActive && state.playing) ? '⏸' : '▶';
-  });
-  document.querySelectorAll('#flat-tracks-list .track-row').forEach(row => {
-    const trackId = parseInt(row.id.replace('flat-track-', ''));
-    const isActive = trackId === state.playingTrackId;
-    row.classList.toggle('playing', isActive);
-    row.classList.toggle('active-playing', isActive && state.playing);
-    const btn = row.querySelector('.track-play-btn');
-    if (btn) btn.textContent = (isActive && state.playing) ? '⏸' : '▶';
-  });
-  refreshCrateGridPlayState();
-  refreshHwPlayState();
-  refreshSongsPlayState();
-}
-
-async function togglePlay() {
-  if (!state.playingTrackId) return;
-  if (state.playing) {
-    // Pause: save playback position, stop source node
-    pbStartOffset += audioCtx.currentTime - pbStartTime;
-    if (currentAudioNode) {
-      currentAudioNode.onended = null;
-      try { currentAudioNode.stop(); } catch (_) {}
-      currentAudioNode.disconnect();
-      currentAudioNode = null;
-    }
-    cancelAnimationFrame(pbTimeRAF);
-    state.playing = false;
-    document.getElementById('btn-play').textContent = '▶';
-    setVinylSpin(false);
-    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
-    pauseMediaFocus();
-  } else {
-    // Resume: create a new source node starting from saved offset
-    const buffer = audioBufferCache.get(state.playingTrackId);
-    if (!buffer) {
-      // Buffer not in cache (track was cued without loading) — fetch and play, honoring
-      // any seek the user performed while paused (otherwise the seek would be discarded).
-      const track = state.playingQueue[state.playingIndex];
-      if (track) loadAndPlay(track, state.playingCrate, pbStartOffset);
-      return;
-    }
-    if (audioCtx.state === 'suspended') await audioCtx.resume();
-    currentAudioNode = audioCtx.createBufferSource();
-    currentAudioNode.buffer = buffer;
-    currentAudioNode.connect(normGainNode);
-    currentAudioNode.onended = onTrackEnded;
-    applyNormGain(state.playingQueue[state.playingIndex]);
-    pbStartTime = audioCtx.currentTime;
-    currentAudioNode.start(0, pbStartOffset);
-    state.playing = true;
-    document.getElementById('btn-play').textContent = '⏸';
-    setVinylSpin(true);
-    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
-    startMediaFocus();
-    startPbTimeUpdate();
-  }
-  refreshDetailPlayState();
-  jukeboxSyncWidget();
-}
-
-function updateMediaSession(track, crate) {
-  if (!('mediaSession' in navigator)) return;
-  const artist  = (state.profile && state.profile.name) ? state.profile.name : '';
-  const album   = crate ? crate.name : (track.crate_name || '');
-  const crateId = crate ? crate.id  : track.crate_id;
-  const artwork = crateId
-    ? [{ src: crateCoverUrl(crateId), sizes: '512x512', type: 'image/jpeg' }]
-    : [];
-  navigator.mediaSession.metadata = new MediaMetadata({
-    title: track.title || '',
-    artist,
-    album,
-    artwork,
-  });
-  navigator.mediaSession.playbackState = 'playing';
-  if (pbDuration && 'setPositionState' in navigator.mediaSession) {
-    try {
-      navigator.mediaSession.setPositionState({
-        duration: pbDuration,
-        position: pbStartOffset,
-        playbackRate: 1,
-      });
-    } catch (_) {}
-  }
-}
-
-function skipTrack(dir) {
-  if (!state.playingQueue.length) return;
-  const next = state.playingIndex + dir;
-  if (next < 0 || next >= state.playingQueue.length) return;
-  state.playingIndex = next;
-
-  const track = state.playingQueue[next];
-
-  // Update flat list highlight when not in the detail view
-  if (state.currentView !== 'detail') {
-    document.querySelectorAll('#flat-tracks-list .track-row').forEach((r, i) =>
-      r.classList.toggle('playing', i === next)
-    );
-  }
-  // Detail list buttons/highlight updated by loadAndPlay → refreshDetailPlayState
-
-  loadAndPlay(track, state.playingCrate);
-}
-
-function getSeekRatio(e) {
-  const bar = document.getElementById('pb-seek');
-  const rect = bar.getBoundingClientRect();
-  return Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-}
-
-function seekToRatio(ratio) {
-  if (!pbDuration) return;
-  const offset = ratio * pbDuration;
-  document.getElementById('pb-seek-fill').style.width = `${ratio * 100}%`;
-  document.getElementById('pb-current').textContent = formatTime(offset);
-  document.getElementById('pb-duration').textContent = '-' + formatTime(Math.max(0, pbDuration - offset));
-  if (state.playing) {
-    // Stop current node and restart at new position
-    if (currentAudioNode) {
-      currentAudioNode.onended = null;
-      try { currentAudioNode.stop(); } catch (_) {}
-      currentAudioNode.disconnect();
-      currentAudioNode = null;
-    }
-    const buffer = audioBufferCache.get(state.playingTrackId);
-    if (!buffer) { pbStartOffset = offset; return; }
-    currentAudioNode = audioCtx.createBufferSource();
-    currentAudioNode.buffer = buffer;
-    currentAudioNode.connect(normGainNode);
-    currentAudioNode.onended = onTrackEnded;
-    pbStartTime = audioCtx.currentTime;
-    pbStartOffset = offset;
-    currentAudioNode.start(0, pbStartOffset);
-  } else {
-    pbStartOffset = offset;
-  }
-}
+// ─── Playback bar ─────────────────────────────────────────────────────────────
 
 function setPbArt(crate) {
   const pbArt = document.getElementById('pb-art');
@@ -4483,55 +4674,6 @@ if ('mediaSession' in navigator) {
   });
 }
 
-// Chromium drops the page from "media producer" status when Web Audio stops,
-// which lets macOS hand media keys back to whichever app was previously active
-// (typically Apple Music). A silent looping <audio> element preserves focus.
-let _mediaFocusAudio = null;
-function ensureMediaFocusAudio() {
-  if (_mediaFocusAudio) return _mediaFocusAudio;
-  const sampleRate = 8000;
-  const length     = sampleRate;
-  const buf        = new ArrayBuffer(44 + length);
-  const v          = new DataView(buf);
-  v.setUint32(0,  0x52494646, false); // "RIFF"
-  v.setUint32(4,  36 + length, true);
-  v.setUint32(8,  0x57415645, false); // "WAVE"
-  v.setUint32(12, 0x666d7420, false); // "fmt "
-  v.setUint32(16, 16, true);
-  v.setUint16(20, 1, true);           // PCM
-  v.setUint16(22, 1, true);           // mono
-  v.setUint32(24, sampleRate, true);
-  v.setUint32(28, sampleRate, true);
-  v.setUint16(32, 1, true);
-  v.setUint16(34, 8, true);           // 8-bit
-  v.setUint32(36, 0x64617461, false); // "data"
-  v.setUint32(40, length, true);
-  for (let i = 0; i < length; i++) v.setUint8(44 + i, 0x80); // 8-bit unsigned silence
-
-  const url = URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
-  const a   = document.createElement('audio');
-  a.src     = url;
-  a.loop    = true;
-  a.volume  = 1;            // data is digital silence; volume>0 keeps Chromium tracking it
-  a.preload = 'auto';
-  a.style.display = 'none';
-  document.body.appendChild(a);
-  _mediaFocusAudio = a;
-  return a;
-}
-function startMediaFocus() {
-  const a = ensureMediaFocusAudio();
-  if (a.paused) a.play().catch(() => {});
-}
-// Pause the silent focus audio so macOS Now Playing reflects the paused state.
-// Without this, Chromium sees the looping <audio> still playing and reports
-// 'playing' to the OS regardless of mediaSession.playbackState, leaving the
-// menu bar widget stuck on ⏸. The element stays on the page so the page
-// retains media-producer status and F8 still routes here on resume.
-function pauseMediaFocus() {
-  if (_mediaFocusAudio && !_mediaFocusAudio.paused) _mediaFocusAudio.pause();
-}
-
 
 document.getElementById('btn-repeat').addEventListener('click', cycleRepeat);
 document.getElementById('btn-volume').addEventListener('click', toggleVolPopup);
@@ -4571,7 +4713,8 @@ function escHtml(str) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 // ─── Songs tag-filter pill clicks (H1: delegated, not inline) ─────────────────

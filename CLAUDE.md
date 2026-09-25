@@ -49,11 +49,12 @@ BEATCRATE_DATA_DIR=/tmp/bc-test cargo run -- --verify-ingest   # writes to the c
 The renderer talks to Rust via **`invoke()`**, not HTTP — there is no server, no port, no loopback. The bridge lives entirely in `public/app.js`:
 
 - **Central facade (don't bypass it):** the one `api(path, opts)` wrapper dispatches every `/api/...`-style call through the `API_ROUTES` route table to `invoke(command, args)`. To add an endpoint: add a `#[tauri::command]` in `commands.rs`, register it in `lib.rs`'s `invoke_handler!`, and add a route-table entry — don't sprinkle raw `invoke()` calls.
-- **File URLs go through `convertFileSrc()`**, not fetch paths: audio (`track_audio_path` → `convertFileSrc`), covers (resolved off `cover_path` in `state.crates`), avatars (`avatar_path` cmd → `convertFileSrc`). The asset protocol is scoped to `$HOME/**` in `tauri.conf.json`.
+- **File URLs go through `convertFileSrc()`**, not fetch paths: audio (`track_audio_path` → `convertFileSrc`), covers (resolved off `cover_path` in `state.crates`), avatars (`avatar_path` cmd → `convertFileSrc`). The asset protocol's static scope is only `$HOME/Library/Application Support/BeatCrate/**` (`tauri.conf.json`); the Music Folder is added at runtime via `allow_directory` (`lib.rs` setup, `set_albums_folder`).
 - **`window.beatcrateNative`** is a shim (defined in app.js) over the dialog + opener plugins: `selectFolder()` → `dialog.open`, `revealPath()` → `opener.revealItemInDir`. Renderer still guards `if (window.beatcrateNative)` (always present under Tauri).
+- **`dragDropEnabled: false` on the window is load-bearing.** Tauri's default native file-drop handler takes the drag session, so HTML5 `dragover`/`drop` never reach the page: every reorder (tracks, to-dos, notes) drags and silently snaps back. The app uses no native file drops.
 - **Capabilities are least-privilege:** only `core:default` + `dialog:allow-open` + `opener:allow-reveal-item-in-dir`. Adding a plugin API the renderer calls means granting it in `capabilities/default.json` or it's silently denied.
 
-**⚠️ Never `canvas.toDataURL()` / `getImageData()` on a `convertFileSrc` (asset:) image** — it taints the canvas and throws `SecurityError`. (Cost a debug cycle: crate-detail backdrop drew the cover to a canvas; fixed by using the URL directly.)
+**⚠️ Never `canvas.toDataURL()` / `getImageData()` on a `convertFileSrc` (asset:) image** — it taints the canvas and throws `SecurityError`.
 
 ## Ingestion, .als index, loudness, watcher (all pure-Rust, no Node/ffmpeg)
 
@@ -62,7 +63,7 @@ The renderer talks to Rust via **`invoke()`**, not HTTP — there is no server, 
 - **Missing files get a 60s grace, not an instant delete** (`PRUNE_GRACE_SECS`). A DAW re-export unlinks then rewrites; the debounced watcher can scan inside that gap, and deleting there destroys the row plus its cascaded notes/tags/plays — the re-inserted row comes back with NULL `sort_order`, so the track also drops to the bottom of its crate. Absent rows are stamped (`tracks.missing_since` / `crates.emptied_since`), cleared on reappearance, deleted only past the window.
 - **.als index** (`als.rs`): `flate2` (gunzip) + `roxmltree` (read-only DOM walk).
 - **Loudness** (`loudness.rs`): `symphonia` 0.5 (decode, `features=["all"]` — pinned 0.5; 0.6 is an undocumented rewrite) → `ebur128` (integrated loudness). **No ffmpeg sidecar.**
-- **Live watcher** (`lib.rs::start_albums_watcher`): `notify-debouncer-mini`, 1.5s debounce. **Full-rescan-on-event** — it deliberately ignores event paths (FSEvents coalesces/mis-types). Folder renames are handled losslessly inside the ingest by `reconcile_renames` (content/filename-set match → UPDATE in place, preserving crate_id + track ids). The debouncer is `mem::forget`'d on purpose (must live for the app lifetime; no teardown hook). Whole-folder deletion leaves orphan rows (nothing prunes them); only within-folder file removal prunes.
+- **Live watcher** (`lib.rs::start_albums_watcher`): `notify-debouncer-mini`, 1.5s debounce. **Full-rescan-on-event** — it deliberately ignores event paths (FSEvents coalesces/mis-types). Folder renames are handled losslessly inside the ingest by `reconcile_renames` (content/filename-set match → UPDATE in place, preserving crate_id + track ids). The debouncer lives in `AppState.watcher` and is replaced when the Music Folder changes. Whole-folder deletion leaves orphan rows (nothing prunes them); only within-folder file removal prunes.
 
 ## Design System (renderer — `public/`)
 
@@ -92,9 +93,6 @@ detach/recreate it — pause-only is what retains focus.
 
 - **Onboarding: folder → profile → loadApp.** First launch (`!config.albums_folder`) shows onboarding; after folder pick → `loadApp()`; if no profile name → profile onboarding → **must call `loadApp()` again** (not `showHome()`) so init runs end-to-end (else no mesh until reload).
 
-- **Auto-save, no Save buttons** — `setupSettingsAutoSave()`; the rest of the
-  settings/native-shim detail is in `docs/RENDERER-PATTERNS.md`.
-
 ## Career Arc — Ableton-specific
 
 The Career Arc view indexes Ableton `.als` projects only. The rest of the app (library, preview, notes, the companion plugin) is DAW-agnostic. Don't imply Career Arc covers other DAWs.
@@ -103,7 +101,7 @@ The Career Arc view indexes Ableton `.als` projects only. The rest of the app (l
 - BPM detection · Waveform display · Cloud sync · Drag-and-drop crate reordering (track reordering within a crate exists).
 
 ## Distribution
-Ships **unsigned, aarch64-only, local-only.** Username is scrubbed from the binary via `--remap-path-prefix` in the gitignored `src-tauri/.cargo/config.toml` plus `strip = true`. App bundle ID is `com.beatcrate.app`; the plugin is `com.beatcrate.plugin`. Optional follow-up: Developer-ID signing, *iff* distributing beyond a personal machine.
+Ships **unsigned, aarch64-only, local-only.** Username is scrubbed from the binary via `--remap-path-prefix` in the gitignored `src-tauri/.cargo/config.toml` plus `strip = true`. App bundle ID is `com.beatcrate.app`; the plugin is `com.beatcrate.plugin`.
 
 **⚠️ Bundle-only CSP gotcha (cost a debug cycle):** the renderer uses inline `on*=` handlers everywhere (~54 of them). On *bundling* (not dev) Tauri injects a script nonce, and per CSP spec a present nonce makes `'unsafe-inline'` ignored → every inline handler is refused → the app boots but is totally inert. Fix already in place: `app.security.dangerousDisableAssetCspModification: ["script-src","style-src"]` in `tauri.conf.json`. This is why you must smoke-test the real bundle, not just `tauri dev`.
 

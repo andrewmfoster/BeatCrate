@@ -55,6 +55,12 @@ bool BeatCrateDB::open (const juce::File& dbFile)
     }
 
     sqlite3_busy_timeout (db, 2000);
+
+    // FKs are per-connection and off by default: without this, addNote on a track
+    // the app just pruned inserts an orphan note and reports success.
+    if (sqlite3_exec (db, "PRAGMA foreign_keys=ON", nullptr, nullptr, nullptr) != SQLITE_OK)
+        lastErr = "PRAGMA foreign_keys: " + juce::String (sqlite3_errmsg (db));
+
     return true;
 }
 
@@ -159,8 +165,11 @@ bool BeatCrateDB::updateNoteCompleted (int64_t noteId, int64_t trackId, bool com
     sqlite3_bind_int64 (stmt, 2, noteId);
     sqlite3_bind_int64 (stmt, 3, trackId);
 
-    const bool ok = sqlite3_step (stmt) == SQLITE_DONE;
-    if (! ok) lastErr = "updateNoteCompleted step: " + juce::String (sqlite3_errmsg (db));
+    const bool stepped = sqlite3_step (stmt) == SQLITE_DONE;
+    // Zero rows = the note was deleted in the app meanwhile; report it, don't claim success.
+    const bool ok = stepped && sqlite3_changes (db) > 0;
+    if (! stepped) lastErr = "updateNoteCompleted step: " + juce::String (sqlite3_errmsg (db));
+    else if (! ok) lastErr = "updateNoteCompleted: no such note";
     sqlite3_finalize (stmt);
     return ok;
 }
@@ -184,8 +193,11 @@ bool BeatCrateDB::updateNoteText (int64_t noteId, int64_t trackId, const juce::S
     sqlite3_bind_int64 (stmt, 2, noteId);
     sqlite3_bind_int64 (stmt, 3, trackId);
 
-    const bool ok = sqlite3_step (stmt) == SQLITE_DONE;
-    if (! ok) lastErr = "updateNoteText step: " + juce::String (sqlite3_errmsg (db));
+    const bool stepped = sqlite3_step (stmt) == SQLITE_DONE;
+    // Zero rows = the note was deleted in the app meanwhile; report it, don't claim success.
+    const bool ok = stepped && sqlite3_changes (db) > 0;
+    if (! stepped) lastErr = "updateNoteText step: " + juce::String (sqlite3_errmsg (db));
+    else if (! ok) lastErr = "updateNoteText: no such note";
     sqlite3_finalize (stmt);
     return ok;
 }
@@ -206,8 +218,11 @@ bool BeatCrateDB::deleteNote (int64_t noteId, int64_t trackId)
     sqlite3_bind_int64 (stmt, 1, noteId);
     sqlite3_bind_int64 (stmt, 2, trackId);
 
-    const bool ok = sqlite3_step (stmt) == SQLITE_DONE;
-    if (! ok) lastErr = "deleteNote step: " + juce::String (sqlite3_errmsg (db));
+    const bool stepped = sqlite3_step (stmt) == SQLITE_DONE;
+    // Zero rows = the note was deleted in the app meanwhile; report it, don't claim success.
+    const bool ok = stepped && sqlite3_changes (db) > 0;
+    if (! stepped) lastErr = "deleteNote step: " + juce::String (sqlite3_errmsg (db));
+    else if (! ok) lastErr = "deleteNote: no such note";
     sqlite3_finalize (stmt);
     return ok;
 }

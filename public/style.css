@@ -879,6 +879,10 @@ body.welcoming .playback-bar {
   border-radius: 3px;
 }
 #songs-track-list .track-row:hover { background: rgba(237,229,211,0.05); }
+/* Playing row: accent title + eq bars are the indicator — drop the global --paper2 slab
+   (near-black in dark mode) so hover reads the same as any other row */
+#songs-track-list .track-row.playing { background: transparent; }
+#songs-track-list .track-row.playing:hover { background: rgba(237,229,211,0.05); }
 .songs-track-art {
   width: 32px; height: 32px;
   border-radius: 2px;

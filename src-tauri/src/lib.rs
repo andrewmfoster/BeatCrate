@@ -36,6 +36,7 @@ pub fn notify(app: &tauri::AppHandle, message: &str, kind: &str) {
 ///   2. tell the renderer to drop the decoded AudioBuffers it's holding for those
 ///      tracks, or a swap made while the app is open keeps playing the old audio
 ///      from cache for the rest of the session.
+///
 /// No-op when nothing changed, which is the overwhelmingly common case.
 pub(crate) fn after_ingest(app: &tauri::AppHandle, invalidated: &[i64]) {
     if invalidated.is_empty() {
@@ -253,7 +254,19 @@ pub(crate) fn start_albums_watcher(
     let mut debouncer = new_debouncer(
         Duration::from_millis(1500),
         move |res: DebounceEventResult| {
-            if res.is_err() {
+            use notify_debouncer_mini::DebouncedEventKind;
+            let Ok(events) = res else {
+                return;
+            };
+            // A2 (09-23 audit H2): a file still being written (a DAW export) emits
+            // AnyContinuous every 1.5s, and each one used to trigger a full ingest.
+            // Wait for the final Any the debouncer sends once the path goes quiet.
+            // The callback runs on the debouncer's one thread, so events arriving
+            // during an ingest queue up and land in a single follow-up batch.
+            if events
+                .iter()
+                .all(|e| e.kind == DebouncedEventKind::AnyContinuous)
+            {
                 return;
             }
             let state = app.state::<AppState>();

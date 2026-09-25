@@ -53,11 +53,12 @@ fn try_exec(conn: &Connection, sql: &str) {
 }
 
 pub(crate) fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
     // Wait-and-retry for up to 5s when the DB is locked (e.g. the external VST3
     // plugin holds a write lock) instead of failing immediately with SQLITE_BUSY.
+    // Set first: the journal_mode pragma below can itself hit BUSY.
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
 
     // ── Core tables ──────────────────────────────────────────────────────────
     conn.execute_batch(
